@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status, Request
 from sqlalchemy import select, func, desc, or_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,12 +31,46 @@ from backend.app.routes.tasks_schemas import (
     TaskAttachmentCreate,
     TaskAttachmentRead,
     ActorSchema,
+    TaskPermissions,
 )
 
 router = APIRouter()
 
+ALLOWED_TASK_UPDATE_FIELDS = {
+    "title", "description", "status", "priority", "task_type", "type",
+    "story_points", "due_date", "project_id", "assignee_id",
+    "assigned_to_id", "reporter_id", "assigner_id"
+}
 
-def _format_task_read(t: Task) -> TaskRead:
+TASK_DETAIL_FIELDS = {
+    "title", "description", "priority", "task_type", "type",
+    "story_points", "due_date", "project_id", "assignee_id",
+    "assigned_to_id", "reporter_id", "assigner_id"
+}
+
+TASK_STATUS_FIELDS = {"status"}
+
+
+def _compute_task_permissions(t: Task, current_user: Optional[User]) -> TaskPermissions:
+    if not current_user:
+        return TaskPermissions(can_edit_details=False, can_change_status=False, can_delete=False)
+    user_role = (current_user.role or "").lower().strip()
+    is_owner_or_admin = user_role in ("owner", "admin")
+    is_creator = (current_user.id == t.reporter_id)
+    is_assignee = (current_user.id == t.assignee_id)
+
+    can_edit_details = is_owner_or_admin or is_creator
+    can_change_status = is_owner_or_admin or is_creator or is_assignee
+    can_delete = is_owner_or_admin or is_creator
+
+    return TaskPermissions(
+        can_edit_details=can_edit_details,
+        can_change_status=can_change_status,
+        can_delete=can_delete,
+    )
+
+
+def _format_task_read(t: Task, current_user: Optional[User] = None) -> TaskRead:
     assignee_actor = (
         ActorSchema(id=t.assignee.id, full_name=t.assignee.full_name, avatar_url=t.assignee.avatar_url)
         if getattr(t, "assignee", None)
@@ -70,6 +104,7 @@ def _format_task_read(t: Task) -> TaskRead:
         assignee=assignee_actor,
         reporter=reporter_actor,
         assigner=reporter_actor,
+        permissions=_compute_task_permissions(t, current_user),
     )
 
 
@@ -157,7 +192,7 @@ async def list_tasks(
     res = await db.execute(query)
     tasks = res.scalars().all()
 
-    items = [_format_task_read(t) for t in tasks]
+    items = [_format_task_read(t, current_user) for t in tasks]
     return TaskListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
@@ -222,7 +257,7 @@ async def get_task(
     t = res.scalars().first()
     if not t:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-    return _format_task_read(t)
+    return _format_task_read(t, current_user)
 
 
 @router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED, summary="Create task")
@@ -356,7 +391,7 @@ async def create_task(
         .where(Task.id == task_id)
     )
     saved_task = res.scalars().first()
-    task_read = _format_task_read(saved_task)
+    task_read = _format_task_read(saved_task, current_user)
 
     # Real-time broadcast to organization workspace
     await ws_manager.broadcast_to_workspace(
@@ -368,15 +403,35 @@ async def create_task(
 
 
 @router.patch("/{task_id}", response_model=TaskRead, summary="Update task")
+@router.put("/{task_id}", response_model=TaskRead, summary="Update task (PUT)")
 async def update_task(
     task_id: str,
     payload: TaskUpdate,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update task fields and log activity if modified, scoped to current organization."""
-    target_assignee = payload.assignee_id or payload.assigned_to_id
-    now = datetime.now(timezone.utc)
+    """Update task fields with strict server-side RBAC and field-level permission checks."""
+    raw_keys = set()
+    try:
+        raw_body = await request.json()
+        if isinstance(raw_body, dict):
+            raw_keys = set(raw_body.keys())
+    except Exception:
+        raw_keys = set()
+
+    provided_fields = raw_keys if raw_keys else payload.model_fields_set
+
+    # Check for unknown or forbidden fields (e.g. organization_id or arbitrary keys)
+    unknown_fields = provided_fields - ALLOWED_TASK_UPDATE_FIELDS
+    if unknown_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "task_edit_forbidden",
+                "message": f"Unknown or forbidden field(s): {', '.join(sorted(unknown_fields))}"
+            }
+        )
 
     res = await db.execute(
         select(Task)
@@ -392,11 +447,43 @@ async def update_task(
     if not t:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    if payload.title is not None:
+    user_role = (current_user.role or "").lower().strip()
+    is_admin_or_owner = user_role in ("owner", "admin")
+    is_creator = (current_user.id == t.reporter_id)
+    is_assignee = (current_user.id == t.assignee_id)
+
+    can_edit_details = is_creator or is_admin_or_owner
+    can_change_status = is_creator or is_admin_or_owner or is_assignee
+
+    # Field-level permission enforcement
+    has_detail_changes = bool(provided_fields & TASK_DETAIL_FIELDS)
+    has_status_changes = bool(provided_fields & TASK_STATUS_FIELDS)
+
+    if has_detail_changes and not can_edit_details:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "task_edit_forbidden",
+                "message": "Only the task creator, organization owner, or administrators can edit task details."
+            }
+        )
+
+    if has_status_changes and not can_change_status:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "task_edit_forbidden",
+                "message": "Only the task assignee, creator, organization owner, or administrators can change task status."
+            }
+        )
+
+    now = datetime.now(timezone.utc)
+
+    if payload.title is not None and "title" in provided_fields:
         t.title = payload.title.strip()
-    if payload.description is not None:
+    if payload.description is not None and "description" in provided_fields:
         t.description = payload.description
-    if payload.status is not None:
+    if payload.status is not None and "status" in provided_fields:
         old_status = t.status
         t.status = payload.status
         if old_status != t.status and t.project_id:
@@ -412,18 +499,32 @@ async def update_task(
                 created_at=now,
             )
             db.add(activity)
-    if payload.priority is not None:
+    if payload.priority is not None and "priority" in provided_fields:
         t.priority = payload.priority
-    if payload.task_type is not None:
-        t.task_type = payload.task_type
-    if payload.story_points is not None:
+    if (payload.task_type is not None or payload.type is not None) and bool(provided_fields & {"task_type", "type"}):
+        t.task_type = payload.task_type or payload.type
+    if payload.story_points is not None and "story_points" in provided_fields:
         t.story_points = payload.story_points
-    if payload.due_date is not None:
+    if payload.due_date is not None and "due_date" in provided_fields:
         t.due_date = payload.due_date
+    if payload.project_id is not None and "project_id" in provided_fields:
+        # Validate project belongs to user's organization
+        p_res = await db.execute(
+            select(Project).where(
+                Project.id == payload.project_id,
+                Project.organization_id == current_user.organization_id
+            )
+        )
+        if not p_res.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Referenced project does not exist or does not belong to your organization"
+            )
+        t.project_id = payload.project_id
+
     target_assigner = payload.assigner_id or payload.reporter_id
-    if target_assigner is not None:
-        user_role = (current_user.role or "").lower()
-        can_change_assigner = user_role in ("owner", "admin", "manager", "lead")
+    if target_assigner is not None and bool(provided_fields & {"assigner_id", "reporter_id"}):
+        can_change_assigner = is_admin_or_owner or user_role in ("manager", "lead")
         if target_assigner != current_user.id and not can_change_assigner:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -443,8 +544,8 @@ async def update_task(
                 )
         t.reporter_id = target_assigner
 
-    if target_assignee is not None:
-        # Validate assignee belongs to organization
+    target_assignee = payload.assignee_id or payload.assigned_to_id
+    if target_assignee is not None and bool(provided_fields & {"assignee_id", "assigned_to_id"}):
         if target_assignee != current_user.id:
             u_res = await db.execute(
                 select(User).where(
@@ -474,7 +575,7 @@ async def update_task(
         .where(Task.id == task_id)
     )
     updated_task = refetch.scalars().first()
-    task_read = _format_task_read(updated_task)
+    task_read = _format_task_read(updated_task, current_user)
 
     await ws_manager.broadcast_to_workspace(
         current_user.organization_id,
@@ -484,14 +585,54 @@ async def update_task(
 
 
 @router.patch("/{task_id}/status", response_model=TaskRead, summary="Change task status")
+@router.put("/{task_id}/status", response_model=TaskRead, summary="Change task status (PUT)")
 async def change_task_status(
     task_id: str,
     payload: TaskStatusChange,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Change status of a task and broadcast event."""
-    res = await update_task(task_id, TaskUpdate(status=payload.status), current_user=current_user, db=db)
+    try:
+        raw_body = await request.json()
+        if isinstance(raw_body, dict):
+            extra_keys = set(raw_body.keys()) - {"status"}
+            if extra_keys:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": "task_edit_forbidden",
+                        "message": f"Only status field is permitted on this endpoint. Disallowed: {', '.join(sorted(extra_keys))}"
+                    }
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    t = res.scalars().first()
+    if not t:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    user_role = (current_user.role or "").lower().strip()
+    is_admin_or_owner = user_role in ("owner", "admin")
+    is_creator = (current_user.id == t.reporter_id)
+    is_assignee = (current_user.id == t.assignee_id)
+
+    if not (is_creator or is_admin_or_owner or is_assignee):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "task_edit_forbidden",
+                "message": "Only the task assignee, creator, organization owner, or administrators can change task status."
+            }
+        )
+
+    res = await update_task(task_id, TaskUpdate(status=payload.status), request=request, current_user=current_user, db=db)
     await ws_manager.broadcast_to_workspace(
         current_user.organization_id,
         {"event": "task_status_changed", "task_id": task_id, "status": payload.status}
@@ -505,13 +646,26 @@ async def delete_task(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete task and broadcast deletion event."""
+    """Delete task and broadcast deletion event (restricted to creator, owner, or admin)."""
     res = await db.execute(
         select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
     )
     t = res.scalars().first()
     if not t:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    user_role = (current_user.role or "").lower().strip()
+    is_admin_or_owner = user_role in ("owner", "admin")
+    is_creator = (current_user.id == t.reporter_id)
+
+    if not (is_creator or is_admin_or_owner):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "task_edit_forbidden",
+                "message": "Only the task creator, organization owner, or administrators can delete tasks."
+            }
+        )
 
     if t.project_id:
         activity = ProjectActivity(

@@ -63,6 +63,12 @@ class TaskCommentRead(BaseSchema):
     updated_at: Optional[datetime] = None
 
 
+class TaskPermissions(BaseSchema):
+    can_edit_details: bool
+    can_change_status: bool
+    can_delete: bool
+
+
 # ---------------------------------------------------------------------------
 # Task
 # ---------------------------------------------------------------------------
@@ -73,6 +79,7 @@ class TaskCreate(BaseSchema):
     status: str = "todo"            # TaskStatus enum value
     priority: str = "medium"        # TaskPriority enum value
     task_type: str = "feature"      # TaskType enum value
+    type: Optional[str] = None
     story_points: Optional[int] = None
     due_date: Optional[datetime] = None
     project_id: Optional[str] = None
@@ -83,6 +90,10 @@ class TaskCreate(BaseSchema):
 
     @model_validator(mode="after")
     def sync_assignee(self):
+        if not self.task_type and self.type:
+            self.task_type = self.type
+        elif not self.type and self.task_type:
+            self.type = self.task_type
         if not self.assignee_id and self.assigned_to_id:
             self.assignee_id = self.assigned_to_id
         elif not self.assigned_to_id and self.assignee_id:
@@ -102,6 +113,7 @@ class TaskUpdate(BaseSchema):
     status: Optional[str] = None
     priority: Optional[str] = None
     task_type: Optional[str] = None
+    type: Optional[str] = None
     story_points: Optional[int] = None
     due_date: Optional[datetime] = None
     project_id: Optional[str] = None
@@ -112,6 +124,10 @@ class TaskUpdate(BaseSchema):
 
     @model_validator(mode="after")
     def sync_assignee(self):
+        if not self.task_type and self.type:
+            self.task_type = self.type
+        elif not self.type and self.task_type:
+            self.type = self.task_type
         if not self.assignee_id and self.assigned_to_id:
             self.assignee_id = self.assigned_to_id
         elif not self.assigned_to_id and self.assignee_id:
@@ -158,6 +174,7 @@ class TaskRead(BaseSchema):
     assignee: Optional[ActorSchema] = None
     reporter: Optional[ActorSchema] = None
     assigner: Optional[ActorSchema] = None
+    permissions: Optional[TaskPermissions] = None
 
     @model_validator(mode="after")
     def sync_assignee(self):
