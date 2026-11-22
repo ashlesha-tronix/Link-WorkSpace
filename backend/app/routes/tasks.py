@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database import get_db
 from backend.app.dependencies import get_current_active_user
-from backend.app.models import Task, Project, User, ProjectActivity, TaskComment, TaskAttachment
+from backend.app.models import Task, Project, User, ProjectActivity, TaskComment, TaskAttachment, TaskActivity, Ticket, AuditLog
 from backend.app.enums import TaskStatus, TaskPriority, TaskType
 from backend.app.core.websockets import ws_manager, authenticate_ws
 from backend.app.services.metrics import get_my_tasks_stats
@@ -27,9 +27,13 @@ from backend.app.routes.tasks_schemas import (
     TaskRead,
     TaskListResponse,
     TaskCommentCreate,
+    TaskCommentUpdate,
     TaskCommentRead,
     TaskAttachmentCreate,
     TaskAttachmentRead,
+    TaskActivityRead,
+    TaskActivityListResponse,
+    LinkTicketRequest,
     ActorSchema,
     TaskPermissions,
 )
@@ -70,17 +74,111 @@ def _compute_task_permissions(t: Task, current_user: Optional[User]) -> TaskPerm
     )
 
 
+def _sanitize_value(val: Optional[any], field_name: Optional[str] = None) -> Optional[str]:
+    if val is None:
+        return None
+    val_str = str(val)
+    if field_name and any(k in field_name.lower() for k in ("password", "token", "secret", "key", "auth")):
+        return "[REDACTED]"
+    if len(val_str) > 500:
+        return val_str[:500]
+    return val_str
+
+
+def _get_actor_display_name(u: Optional[User]) -> str:
+    if not u:
+        return "Deleted user"
+    return (u.display_name or u.full_name or "").strip() or "Deleted user"
+
+
+def _build_actor_schema(u: Optional[User], fallback_id: Optional[str] = None) -> Optional[ActorSchema]:
+    if not u:
+        if fallback_id:
+            return ActorSchema(
+                id=fallback_id,
+                full_name="Deleted user",
+                display_name="Deleted user",
+                avatar_url=None,
+                role=None,
+            )
+        return None
+    name = _get_actor_display_name(u)
+    return ActorSchema(
+        id=u.id,
+        full_name=name,
+        display_name=u.display_name or name,
+        avatar_url=u.avatar_url,
+        role=u.role,
+    )
+
+
+def _format_task_activity_summary(
+    action: str,
+    field_name: Optional[str],
+    old_val: Optional[str],
+    new_val: Optional[str],
+    actor_name: str,
+    meta: Optional[dict] = None,
+) -> str:
+    meta = meta or {}
+    if action == "created":
+        return f"{actor_name} created the task"
+    elif action == "status_changed":
+        return f"{actor_name} changed status from '{old_val or 'none'}' to '{new_val or 'none'}'"
+    elif action == "assignee_changed":
+        old_label = meta.get("old_assignee_name") or old_val or "Unassigned"
+        new_label = meta.get("new_assignee_name") or new_val or "Unassigned"
+        return f"{actor_name} changed assignee from '{old_label}' to '{new_label}'"
+    elif action == "field_updated":
+        field_display = (field_name or "field").replace("_", " ")
+        return f"{actor_name} updated {field_display}"
+    elif action == "comment_added":
+        return f"{actor_name} added a comment"
+    elif action == "comment_edited":
+        return f"{actor_name} edited a comment"
+    elif action == "comment_deleted":
+        return f"{actor_name} deleted a comment"
+    elif action == "attachment_added":
+        fname = meta.get("filename") or new_val or "file"
+        return f"{actor_name} attached {fname}"
+    elif action == "attachment_removed":
+        fname = meta.get("filename") or old_val or "file"
+        return f"{actor_name} removed attachment {fname}"
+    elif action == "ticket_linked":
+        tnum = meta.get("ticket_number") or new_val or "ticket"
+        return f"{actor_name} linked ticket {tnum}"
+    elif action == "ticket_unlinked":
+        tnum = meta.get("ticket_number") or old_val or "ticket"
+        return f"{actor_name} unlinked ticket {tnum}"
+    elif action == "task_deleted":
+        return f"{actor_name} deleted the task"
+    return f"{actor_name} performed {action.replace('_', ' ')}"
+
+
+def _format_task_activity_read(act: TaskActivity, actor: Optional[User]) -> TaskActivityRead:
+    actor_name = _get_actor_display_name(actor)
+    return TaskActivityRead(
+        id=act.id,
+        task_id=act.task_id,
+        organization_id=act.organization_id,
+        actor_id=act.actor_id,
+        actor_name=actor_name,
+        actor_avatar=actor.avatar_url if actor else None,
+        action=act.action,
+        field_name=act.field_name,
+        old_value=act.old_value,
+        new_value=act.new_value,
+        summary=_format_task_activity_summary(
+            act.action, act.field_name, act.old_value, act.new_value, actor_name, act.meta
+        ),
+        meta=act.meta,
+        created_at=act.created_at,
+    )
+
+
 def _format_task_read(t: Task, current_user: Optional[User] = None) -> TaskRead:
-    assignee_actor = (
-        ActorSchema(id=t.assignee.id, full_name=t.assignee.full_name, avatar_url=t.assignee.avatar_url)
-        if getattr(t, "assignee", None)
-        else None
-    )
-    reporter_actor = (
-        ActorSchema(id=t.reporter.id, full_name=t.reporter.full_name, avatar_url=t.reporter.avatar_url)
-        if getattr(t, "reporter", None)
-        else None
-    )
+    assignee_actor = _build_actor_schema(getattr(t, "assignee", None), getattr(t, "assignee_id", None))
+    reporter_actor = _build_actor_schema(getattr(t, "reporter", None), getattr(t, "reporter_id", None))
     return TaskRead(
         id=t.id,
         task_number=t.task_number,
@@ -363,6 +461,20 @@ async def create_task(
     db.add(new_task)
     await db.flush()
 
+    task_activity = TaskActivity(
+        id=str(uuid4()),
+        task_id=new_task.id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="created",
+        field_name=None,
+        old_value=None,
+        new_value=_sanitize_value(new_task.title),
+        meta={"task_number": new_task.task_number, "title": new_task.title},
+        created_at=now,
+    )
+    db.add(task_activity)
+
     if project:
         activity = ProjectActivity(
             project_id=project.id,
@@ -397,6 +509,11 @@ async def create_task(
     await ws_manager.broadcast_to_workspace(
         current_user.organization_id,
         {"event": "task_created", "task": task_read.model_dump(mode="json")}
+    )
+    act_read = _format_task_activity_read(task_activity, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
     )
 
     return task_read
@@ -479,36 +596,93 @@ async def update_task(
 
     now = datetime.now(timezone.utc)
 
+    old_title = t.title
+    old_description = t.description
+    old_status = t.status
+    old_priority = t.priority
+    old_task_type = t.task_type
+    old_story_points = t.story_points
+    old_due_date = t.due_date
+    old_project_id = t.project_id
+    old_assignee_id = t.assignee_id
+    old_reporter_id = t.reporter_id
+
+    activities_to_broadcast: List[TaskActivity] = []
+
+    def _log_field_activity(
+        action: str,
+        field_name: Optional[str],
+        old_val: Optional[str],
+        new_val: Optional[str],
+        meta: Optional[dict] = None,
+    ):
+        act = TaskActivity(
+            id=str(uuid4()),
+            task_id=t.id,
+            organization_id=current_user.organization_id,
+            actor_id=current_user.id,
+            action=action,
+            field_name=field_name,
+            old_value=_sanitize_value(old_val, field_name),
+            new_value=_sanitize_value(new_val, field_name),
+            meta=meta,
+            created_at=now,
+        )
+        db.add(act)
+        activities_to_broadcast.append(act)
+
     if payload.title is not None and "title" in provided_fields:
-        t.title = payload.title.strip()
+        new_title = payload.title.strip()
+        if new_title != old_title:
+            t.title = new_title
+            _log_field_activity("field_updated", "title", old_title, new_title)
+
     if payload.description is not None and "description" in provided_fields:
-        t.description = payload.description
+        if payload.description != old_description:
+            t.description = payload.description
+            _log_field_activity("field_updated", "description", old_description, payload.description)
+
     if payload.status is not None and "status" in provided_fields:
-        old_status = t.status
-        t.status = payload.status
-        if old_status != t.status and t.project_id:
-            activity = ProjectActivity(
-                project_id=t.project_id,
-                actor_id=current_user.id,
-                action="task_status_changed",
-                category="tasks",
-                target_type="task",
-                target_id=t.id,
-                target_title=t.title,
-                details=f"Status changed from {old_status} to {t.status}",
-                created_at=now,
-            )
-            db.add(activity)
+        new_status = payload.status.lower().replace("to_do", "todo")
+        if new_status != old_status:
+            t.status = new_status
+            _log_field_activity("status_changed", "status", old_status, new_status)
+            if t.project_id:
+                activity = ProjectActivity(
+                    project_id=t.project_id,
+                    actor_id=current_user.id,
+                    action="task_status_changed",
+                    category="tasks",
+                    target_type="task",
+                    target_id=t.id,
+                    target_title=t.title,
+                    details=f"Status changed from {old_status} to {t.status}",
+                    created_at=now,
+                )
+                db.add(activity)
+
     if payload.priority is not None and "priority" in provided_fields:
-        t.priority = payload.priority
+        if payload.priority != old_priority:
+            t.priority = payload.priority
+            _log_field_activity("field_updated", "priority", old_priority, payload.priority)
+
     if (payload.task_type is not None or payload.type is not None) and bool(provided_fields & {"task_type", "type"}):
-        t.task_type = payload.task_type or payload.type
+        new_type = payload.task_type or payload.type
+        if new_type != old_task_type:
+            t.task_type = new_type
+            _log_field_activity("field_updated", "task_type", old_task_type, new_type)
+
     if payload.story_points is not None and "story_points" in provided_fields:
-        t.story_points = payload.story_points
+        if payload.story_points != old_story_points:
+            t.story_points = payload.story_points
+            _log_field_activity("field_updated", "story_points", str(old_story_points) if old_story_points is not None else None, str(payload.story_points))
+
     if payload.due_date is not None and "due_date" in provided_fields:
-        t.due_date = payload.due_date
+        if payload.due_date != old_due_date:
+            t.due_date = payload.due_date
+            _log_field_activity("field_updated", "due_date", old_due_date.isoformat() if old_due_date else None, payload.due_date.isoformat() if payload.due_date else None)
+
     if payload.project_id is not None and "project_id" in provided_fields:
-        # Validate project belongs to user's organization
         p_res = await db.execute(
             select(Project).where(
                 Project.id == payload.project_id,
@@ -520,7 +694,9 @@ async def update_task(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Referenced project does not exist or does not belong to your organization"
             )
-        t.project_id = payload.project_id
+        if payload.project_id != old_project_id:
+            t.project_id = payload.project_id
+            _log_field_activity("field_updated", "project_id", old_project_id, payload.project_id)
 
     target_assigner = payload.assigner_id or payload.reporter_id
     if target_assigner is not None and bool(provided_fields & {"assigner_id", "reporter_id"}):
@@ -542,10 +718,13 @@ async def update_task(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Assigner does not belong to your organization"
                 )
-        t.reporter_id = target_assigner
+        if target_assigner != old_reporter_id:
+            t.reporter_id = target_assigner
+            _log_field_activity("field_updated", "reporter_id", old_reporter_id, target_assigner)
 
     target_assignee = payload.assignee_id or payload.assigned_to_id
     if target_assignee is not None and bool(provided_fields & {"assignee_id", "assigned_to_id"}):
+        new_assignee_user = None
         if target_assignee != current_user.id:
             u_res = await db.execute(
                 select(User).where(
@@ -553,12 +732,26 @@ async def update_task(
                     User.organization_id == current_user.organization_id
                 )
             )
-            if not u_res.scalars().first():
+            new_assignee_user = u_res.scalars().first()
+            if not new_assignee_user:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Assignee does not belong to your organization"
                 )
-        t.assignee_id = target_assignee
+        else:
+            new_assignee_user = current_user
+
+        if target_assignee != old_assignee_id:
+            t.assignee_id = target_assignee
+            old_name = _get_actor_display_name(t.assignee) if t.assignee else "Unassigned"
+            new_name = _get_actor_display_name(new_assignee_user) if new_assignee_user else "Unassigned"
+            _log_field_activity(
+                "assignee_changed",
+                "assignee_id",
+                old_assignee_id,
+                target_assignee,
+                meta={"old_assignee_name": old_name, "new_assignee_name": new_name}
+            )
 
     t.updated_at = now
     await db.commit()
@@ -581,6 +774,12 @@ async def update_task(
         current_user.organization_id,
         {"event": "task_updated", "task": task_read.model_dump(mode="json")}
     )
+    for act in activities_to_broadcast:
+        act_read = _format_task_activity_read(act, current_user)
+        await ws_manager.broadcast_to_workspace(
+            current_user.organization_id,
+            {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+        )
     return task_read
 
 
@@ -680,6 +879,15 @@ async def delete_task(
             created_at=datetime.now(timezone.utc),
         )
         db.add(activity)
+    else:
+        audit = AuditLog(
+            organization_id=t.organization_id,
+            actor_id=current_user.id,
+            action="task_deleted",
+            details=f"Deleted task {t.task_number}: {t.title}",
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(audit)
 
     await db.delete(t)
     await db.commit()
@@ -694,6 +902,46 @@ async def delete_task(
 # Comments (Scoped to Organization)
 # ---------------------------------------------------------------------------
 
+def _build_comment_read(c: TaskComment) -> TaskCommentRead:
+    author = getattr(c, "author", None)
+    author_name = "Deleted user"
+    author_avatar = None
+    author_role = None
+    author_actor = None
+    if author:
+        author_name = (author.display_name or author.full_name or "").strip() or "Deleted user"
+        author_avatar = author.avatar_url
+        author_role = author.role
+        author_actor = ActorSchema(
+            id=author.id,
+            full_name=author_name,
+            display_name=author.display_name or author_name,
+            avatar_url=author.avatar_url,
+            role=author.role,
+        )
+    elif c.author_id:
+        author_name = "Deleted user"
+        author_actor = ActorSchema(
+            id=c.author_id,
+            full_name="Deleted user",
+            display_name="Deleted user",
+            avatar_url=None,
+            role=None,
+        )
+    return TaskCommentRead(
+        id=c.id,
+        body=c.body,
+        task_id=c.task_id,
+        author_id=c.author_id,
+        author_name=author_name,
+        author_avatar=author_avatar,
+        author_role=author_role,
+        author=author_actor,
+        created_at=c.created_at,
+        updated_at=c.updated_at,
+    )
+
+
 @router.get("/{task_id}/comments", response_model=List[TaskCommentRead], summary="List task comments")
 async def list_comments(
     task_id: str,
@@ -701,7 +949,6 @@ async def list_comments(
     db: AsyncSession = Depends(get_db),
 ):
     """List comments for a task in user's organization."""
-    # Verify task ownership
     t_res = await db.execute(
         select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
     )
@@ -709,20 +956,13 @@ async def list_comments(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
     res = await db.execute(
-        select(TaskComment).where(TaskComment.task_id == task_id).order_by(TaskComment.created_at.asc())
+        select(TaskComment)
+        .options(selectinload(TaskComment.author))
+        .where(TaskComment.task_id == task_id)
+        .order_by(TaskComment.created_at.asc())
     )
     comments = res.scalars().all()
-    return [
-        TaskCommentRead(
-            id=c.id,
-            body=c.body,
-            task_id=c.task_id,
-            author_id=c.author_id,
-            created_at=c.created_at,
-            updated_at=c.updated_at,
-        )
-        for c in comments
-    ]
+    return [_build_comment_read(c) for c in comments]
 
 
 @router.post("/{task_id}/comments", response_model=TaskCommentRead, status_code=status.HTTP_201_CREATED, summary="Add comment")
@@ -749,21 +989,158 @@ async def add_comment(
         created_at=now,
     )
     db.add(c_obj)
+
+    # Activity recorded in the same transaction
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task_id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="comment_added",
+        field_name=None,
+        old_value=None,
+        new_value=_sanitize_value(payload.body),
+        meta={"comment_id": cid, "snippet": _sanitize_value(payload.body[:100])},
+        created_at=now,
+    )
+    db.add(act)
     await db.commit()
 
-    comment_read = TaskCommentRead(
-        id=cid,
-        body=payload.body,
-        task_id=task_id,
-        author_id=current_user.id,
-        created_at=now,
-        updated_at=None,
+    c_res = await db.execute(
+        select(TaskComment).options(selectinload(TaskComment.author)).where(TaskComment.id == cid)
     )
+    saved_comment = c_res.scalars().first()
+    comment_read = _build_comment_read(saved_comment)
+
     await ws_manager.broadcast_to_workspace(
         current_user.organization_id,
         {"event": "comment_added", "task_id": task_id, "comment": comment_read.model_dump(mode="json")}
     )
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
     return comment_read
+
+
+@router.patch("/{task_id}/comments/{comment_id}", response_model=TaskCommentRead, summary="Edit comment")
+@router.put("/{task_id}/comments/{comment_id}", response_model=TaskCommentRead, summary="Edit comment (PUT)")
+async def update_comment(
+    task_id: str,
+    comment_id: str,
+    payload: TaskCommentUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Edit comment body."""
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    c_res = await db.execute(
+        select(TaskComment).options(selectinload(TaskComment.author)).where(TaskComment.id == comment_id, TaskComment.task_id == task_id)
+    )
+    comment = c_res.scalars().first()
+    if not comment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
+
+    user_role = (current_user.role or "").lower().strip()
+    is_admin_or_owner = user_role in ("owner", "admin")
+    is_author = (current_user.id == comment.author_id)
+    if not (is_author or is_admin_or_owner):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit another user's comment")
+
+    old_body = comment.body
+    now = datetime.now(timezone.utc)
+    comment.body = payload.body
+    comment.updated_at = now
+
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task_id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="comment_edited",
+        field_name=None,
+        old_value=_sanitize_value(old_body),
+        new_value=_sanitize_value(payload.body),
+        meta={"comment_id": comment_id, "snippet": _sanitize_value(payload.body[:100])},
+        created_at=now,
+    )
+    db.add(act)
+    await db.commit()
+
+    comment_read = _build_comment_read(comment)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "comment_updated", "task_id": task_id, "comment": comment_read.model_dump(mode="json")}
+    )
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
+    return comment_read
+
+
+@router.delete("/{task_id}/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete comment")
+async def delete_comment(
+    task_id: str,
+    comment_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a task comment."""
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    c_res = await db.execute(
+        select(TaskComment).where(TaskComment.id == comment_id, TaskComment.task_id == task_id)
+    )
+    comment = c_res.scalars().first()
+    if not comment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
+
+    user_role = (current_user.role or "").lower().strip()
+    is_admin_or_owner = user_role in ("owner", "admin")
+    is_author = (current_user.id == comment.author_id)
+    if not (is_author or is_admin_or_owner):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another user's comment")
+
+    now = datetime.now(timezone.utc)
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task_id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="comment_deleted",
+        field_name=None,
+        old_value=_sanitize_value(comment.body),
+        new_value=None,
+        meta={"comment_id": comment_id},
+        created_at=now,
+    )
+    db.add(act)
+    await db.delete(comment)
+    await db.commit()
+
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "comment_deleted", "task_id": task_id, "comment_id": comment_id}
+    )
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -829,9 +1206,24 @@ async def register_attachment(
         created_at=now,
     )
     db.add(a_obj)
+
+    # Activity recorded in the same transaction
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task_id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="attachment_added",
+        field_name=None,
+        old_value=None,
+        new_value=_sanitize_value(payload.filename),
+        meta={"attachment_id": aid, "filename": payload.filename, "file_size": payload.file_size},
+        created_at=now,
+    )
+    db.add(act)
     await db.commit()
 
-    return TaskAttachmentRead(
+    att_read = TaskAttachmentRead(
         id=aid,
         filename=payload.filename,
         file_size=payload.file_size,
@@ -841,6 +1233,222 @@ async def register_attachment(
         uploader_id=current_user.id,
         created_at=now,
     )
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
+    return att_read
+
+
+@router.delete("/{task_id}/attachments/{attachment_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete attachment")
+async def delete_attachment(
+    task_id: str,
+    attachment_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a task attachment."""
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    a_res = await db.execute(
+        select(TaskAttachment).where(TaskAttachment.id == attachment_id, TaskAttachment.task_id == task_id)
+    )
+    attachment = a_res.scalars().first()
+    if not attachment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found")
+
+    user_role = (current_user.role or "").lower().strip()
+    is_admin_or_owner = user_role in ("owner", "admin")
+    is_uploader = (current_user.id == attachment.uploader_id)
+    is_creator = (current_user.id == task.reporter_id)
+    if not (is_uploader or is_creator or is_admin_or_owner):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete this attachment")
+
+    now = datetime.now(timezone.utc)
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task_id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="attachment_removed",
+        field_name=None,
+        old_value=_sanitize_value(attachment.filename),
+        new_value=None,
+        meta={"attachment_id": attachment_id, "filename": attachment.filename},
+        created_at=now,
+    )
+    db.add(act)
+    await db.delete(attachment)
+    await db.commit()
+
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket Linking (Task 1 & Task 3)
+# ---------------------------------------------------------------------------
+
+@router.post("/{task_id}/tickets", summary="Link ticket to task")
+@router.post("/{task_id}/tickets/{ticket_id}", summary="Link ticket to task by path ID")
+async def link_ticket(
+    task_id: str,
+    ticket_id: Optional[str] = None,
+    payload: Optional[LinkTicketRequest] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Link an organization ticket to this task."""
+    target_ticket_id = ticket_id or (payload.ticket_id if payload else None)
+    if not target_ticket_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ticket_id is required")
+
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    tick_res = await db.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.project))
+        .where(Ticket.id == target_ticket_id)
+    )
+    ticket = tick_res.scalars().first()
+    if not ticket or (ticket.project and ticket.project.organization_id != current_user.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
+
+    ticket.task_id = task.id
+    now = datetime.now(timezone.utc)
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task.id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="ticket_linked",
+        field_name="task_id",
+        old_value=None,
+        new_value=ticket.ticket_number,
+        meta={"ticket_id": ticket.id, "ticket_number": ticket.ticket_number, "ticket_title": ticket.title},
+        created_at=now,
+    )
+    db.add(act)
+    await db.commit()
+
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
+    return {"status": "linked", "task_id": task.id, "ticket_id": ticket.id, "ticket_number": ticket.ticket_number}
+
+
+@router.delete("/{task_id}/tickets/{ticket_id}", summary="Unlink ticket from task")
+async def unlink_ticket(
+    task_id: str,
+    ticket_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Unlink a ticket from this task."""
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    tick_res = await db.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.project))
+        .where(Ticket.id == ticket_id)
+    )
+    ticket = tick_res.scalars().first()
+    if not ticket or ticket.task_id != task.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked ticket not found")
+
+    ticket.task_id = None
+    now = datetime.now(timezone.utc)
+    act = TaskActivity(
+        id=str(uuid4()),
+        task_id=task.id,
+        organization_id=current_user.organization_id,
+        actor_id=current_user.id,
+        action="ticket_unlinked",
+        field_name="task_id",
+        old_value=ticket.ticket_number,
+        new_value=None,
+        meta={"ticket_id": ticket.id, "ticket_number": ticket.ticket_number, "ticket_title": ticket.title},
+        created_at=now,
+    )
+    db.add(act)
+    await db.commit()
+
+    act_read = _format_task_activity_read(act, current_user)
+    await ws_manager.broadcast_to_workspace(
+        current_user.organization_id,
+        {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
+    )
+    return {"status": "unlinked", "task_id": task.id, "ticket_id": ticket.id}
+
+
+# ---------------------------------------------------------------------------
+# Task Activity Log (Task 3)
+# ---------------------------------------------------------------------------
+
+@router.get("/{task_id}/activity", response_model=TaskActivityListResponse, summary="Get task activity log")
+async def get_task_activity(
+    task_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=50),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get paginated task activity log, newest first, max page size 50.
+    Scoped to current user's organization and only visible to authorized viewers.
+    """
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    count_res = await db.execute(
+        select(func.count(TaskActivity.id)).where(
+            TaskActivity.task_id == task_id,
+            TaskActivity.organization_id == current_user.organization_id,
+        )
+    )
+    total = count_res.scalar() or 0
+
+    stmt = (
+        select(TaskActivity)
+        .options(selectinload(TaskActivity.actor))
+        .where(
+            TaskActivity.task_id == task_id,
+            TaskActivity.organization_id == current_user.organization_id,
+        )
+        .order_by(desc(TaskActivity.created_at))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    res = await db.execute(stmt)
+    activities = res.scalars().all()
+
+    items = [_format_task_activity_read(act, act.actor) for act in activities]
+    return TaskActivityListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,9 @@ class BaseSchema(BaseModel):
 class ActorSchema(BaseSchema):
     id: str
     full_name: str
+    display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    role: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +56,52 @@ class TaskCommentCreate(BaseSchema):
     body: str
 
 
+class TaskCommentUpdate(BaseSchema):
+    body: str
+
+
 class TaskCommentRead(BaseSchema):
     id: str
     body: str
     task_id: str
     author_id: str
+    author_name: str = "Deleted user"
+    author_avatar: Optional[str] = None
+    author_role: Optional[str] = None
+    author: Optional[ActorSchema] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Task Activity & Ticket Link Schemas
+# ---------------------------------------------------------------------------
+
+class TaskActivityRead(BaseSchema):
+    id: str
+    task_id: str
+    organization_id: str
+    actor_id: Optional[str] = None
+    actor_name: str
+    actor_avatar: Optional[str] = None
+    action: str
+    field_name: Optional[str] = None
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    summary: str
+    meta: Optional[dict] = None
+    created_at: datetime
+
+
+class TaskActivityListResponse(BaseSchema):
+    items: List[TaskActivityRead]
+    total: int
+    page: int
+    page_size: int
+
+
+class LinkTicketRequest(BaseSchema):
+    ticket_id: str
 
 
 class TaskPermissions(BaseSchema):
