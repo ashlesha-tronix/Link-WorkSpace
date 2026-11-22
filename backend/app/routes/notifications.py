@@ -18,10 +18,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database import get_db
 from backend.app.dependencies import get_current_active_user
-from backend.app.models import Notification, User, Membership, Ticket
+from backend.app.models import Notification, User, Membership, Ticket, Project
 from backend.app.core.websockets import ws_manager, authenticate_ws
 
 router = APIRouter()
+
+
+def _get_user_org_id(user: User) -> Optional[str]:
+    """Safely resolve user's tenant organization ID with active membership fallback."""
+    if user.organization_id:
+        return user.organization_id
+    if user.memberships:
+        active = [m for m in user.memberships if getattr(m, "status", "active") == "active"]
+        if active:
+            return active[0].organization_id
+        return user.memberships[0].organization_id
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +107,10 @@ def _format_notification_item(
         else:
             target_label = "User: Team Member"
     elif n.target_type == "ticket" and n.target_id:
-        target_label = ticket_map.get(n.target_id, n.target_id)
+        if n.target_id.startswith("TKT-"):
+            target_label = n.target_id
+        else:
+            target_label = ticket_map.get(n.target_id, "Ticket")
     elif n.target_type == "join_request":
         target_label = "Join Request"
     elif n.target_id and not n.target_id.startswith("usr_"):
@@ -132,9 +147,10 @@ async def list_notifications(
     db: AsyncSession = Depends(get_db),
 ):
     """Return paginated notifications strictly scoped to the authenticated user within their organization."""
+    user_org_id = _get_user_org_id(current_user)
     base_filter = [
         Notification.user_id == current_user.id,
-        Notification.organization_id == current_user.organization_id,
+        Notification.organization_id == user_org_id,
     ]
     if unread_only:
         base_filter.append(Notification.is_read.is_(False))
@@ -151,7 +167,7 @@ async def list_notifications(
     # Total unread count for badge matching current stream scope
     unread_filter = [
         Notification.user_id == current_user.id,
-        Notification.organization_id == current_user.organization_id,
+        Notification.organization_id == user_org_id,
         Notification.is_read.is_(False),
     ]
     if inbox_only:
@@ -193,7 +209,7 @@ async def list_notifications(
             .join(Membership, Membership.user_id == User.id)
             .where(
                 User.id.in_(user_ids),
-                Membership.organization_id == current_user.organization_id,
+                Membership.organization_id == user_org_id,
                 Membership.status == "active",
             )
         )
@@ -203,9 +219,11 @@ async def list_notifications(
     ticket_map = {}
     if ticket_ids:
         t_res = await db.execute(
-            select(Ticket.id, Ticket.ticket_number).where(
+            select(Ticket.id, Ticket.ticket_number)
+            .join(Project, Ticket.project_id == Project.id)
+            .where(
                 Ticket.id.in_(ticket_ids),
-                Ticket.organization_id == current_user.organization_id,
+                Project.organization_id == user_org_id,
             )
         )
         for tid, tnum in t_res.all():
@@ -229,9 +247,10 @@ async def get_unread_count(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns the total number of unread notifications for badge display."""
+    user_org_id = _get_user_org_id(current_user)
     unread_q = select(func.count(Notification.id)).where(
         Notification.user_id == current_user.id,
-        Notification.organization_id == current_user.organization_id,
+        Notification.organization_id == user_org_id,
         Notification.is_read.is_(False),
     )
     res = await db.execute(unread_q)
@@ -239,7 +258,7 @@ async def get_unread_count(
 
     breach_q = select(func.count(Notification.id)).where(
         Notification.user_id == current_user.id,
-        Notification.organization_id == current_user.organization_id,
+        Notification.organization_id == user_org_id,
         Notification.is_read.is_(False),
         Notification.type == "sla_breach",
     )
@@ -255,9 +274,10 @@ async def get_inbox_count(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns unread actionable notification count (assigned tickets, mentions, comments) for the user."""
+    user_org_id = _get_user_org_id(current_user)
     inbox_q = select(func.count(Notification.id)).where(
         Notification.user_id == current_user.id,
-        Notification.organization_id == current_user.organization_id,
+        Notification.organization_id == user_org_id,
         Notification.is_read.is_(False),
         Notification.type.in_(["ticket_assigned", "mention", "comment"])
     )
@@ -273,11 +293,12 @@ async def mark_notification_read(
     db: AsyncSession = Depends(get_db),
 ):
     """Mark a single notification as read."""
+    user_org_id = _get_user_org_id(current_user)
     res = await db.execute(
         select(Notification).where(
             Notification.id == notification_id,
             Notification.user_id == current_user.id,
-            Notification.organization_id == current_user.organization_id,
+            Notification.organization_id == user_org_id,
         )
     )
     notif = res.scalars().first()
@@ -287,11 +308,24 @@ async def mark_notification_read(
     notif.is_read = True
     await db.commit()
 
+    unread_q = select(func.count(Notification.id)).where(
+        Notification.user_id == current_user.id,
+        Notification.organization_id == user_org_id,
+        Notification.is_read.is_(False),
+    )
+    unread_res = await db.execute(unread_q)
+    new_unread = unread_res.scalar() or 0
+
     await ws_manager.broadcast_to_user(
         current_user.id,
-        {"event": "notification_read", "notification_id": notification_id, "user_id": current_user.id}
+        {
+            "event": "notification_read",
+            "notification_id": notification_id,
+            "user_id": current_user.id,
+            "unread_count": new_unread,
+        }
     )
-    return {"success": True, "notification_id": notification_id}
+    return {"success": True, "notification_id": notification_id, "unread_count": new_unread}
 
 
 @router.patch("/read-all", response_model=BulkMarkReadResponse, summary="Mark all notifications as read")
@@ -300,11 +334,12 @@ async def mark_all_notifications_read(
     db: AsyncSession = Depends(get_db),
 ):
     """Mark every unread notification as read for the authenticated user."""
+    user_org_id = _get_user_org_id(current_user)
     stmt = (
         update(Notification)
         .where(
             Notification.user_id == current_user.id,
-            Notification.organization_id == current_user.organization_id,
+            Notification.organization_id == user_org_id,
             Notification.is_read.is_(False),
         )
         .values(is_read=True)
@@ -313,11 +348,15 @@ async def mark_all_notifications_read(
     await db.commit()
     count = res.rowcount if hasattr(res, "rowcount") else 0
 
-    if count:
-        await ws_manager.broadcast_to_user(
-            current_user.id,
-            {"event": "all_notifications_read", "marked_count": count, "user_id": current_user.id}
-        )
+    await ws_manager.broadcast_to_user(
+        current_user.id,
+        {
+            "event": "all_notifications_read",
+            "marked_count": count,
+            "user_id": current_user.id,
+            "unread_count": 0,
+        }
+    )
     return BulkMarkReadResponse(marked_count=count)
 
 
@@ -341,13 +380,14 @@ async def notifications_ws(
     if not user:
         return
 
-    target_ws = workspace_id or user.organization_id
+    user_org_id = _get_user_org_id(user)
+    target_ws = workspace_id or user_org_id
     await ws_manager.connect(websocket, target_ws, user_id=user.id)
 
     # Send current unread count on connect
     unread_q = select(func.count(Notification.id)).where(
         Notification.user_id == user.id,
-        Notification.organization_id == user.organization_id,
+        Notification.organization_id == user_org_id,
         Notification.is_read.is_(False),
     )
     res = await db.execute(unread_q)
