@@ -100,6 +100,15 @@ export const STATUS_CONFIG = {
     badge: 'bg-status-on-hold/15 text-status-on-hold',
     icon: 'pause_circle',
   },
+  passed: {
+    key: 'passed',
+    label: 'Passed',
+    bg: 'bg-purple-500/15',
+    text: 'text-purple-600 dark:text-purple-400',
+    dot: 'bg-purple-500',
+    badge: 'bg-purple-500/15 text-purple-600 dark:text-purple-400',
+    icon: 'forward',
+  },
   resolved: {
     key: 'resolved',
     label: 'Resolved',

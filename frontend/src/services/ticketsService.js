@@ -137,6 +137,31 @@ export const ticketsService = {
     return res.data;
   },
 
+  acceptTicket: async (ticketId, data = {}) => {
+    const res = await apiClient.post(`/tickets/${ticketId}/accept`, data);
+    return res.data;
+  },
+
+  passTicket: async (ticketId, data) => {
+    const res = await apiClient.post(`/tickets/${ticketId}/pass`, data);
+    return res.data;
+  },
+
+  holdTicket: async (ticketId, data) => {
+    const res = await apiClient.post(`/tickets/${ticketId}/hold`, data);
+    return res.data;
+  },
+
+  resumeTicket: async (ticketId, data = {}) => {
+    const res = await apiClient.post(`/tickets/${ticketId}/resume`, data);
+    return res.data;
+  },
+
+  reassignTicketByOwner: async (ticketId, data) => {
+    const res = await apiClient.post(`/tickets/${ticketId}/reassign`, data);
+    return res.data;
+  },
+
   getAttachmentDownloadUrl: (ticketId, attachmentId) => {
     const baseUrl = apiClient.defaults.baseURL || '/api/v1';
     return `${baseUrl}/tickets/${ticketId}/attachments/${attachmentId}/download`;
