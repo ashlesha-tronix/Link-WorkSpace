@@ -15,12 +15,14 @@ export const useTickets = ({
   initialSeverity = 'all',
   initialStatus = 'all',
   initialSla = 'all',
+  initialTaskId = 'all',
   autoConnectWs = true,
 } = {}) => {
   const [search, setSearch] = useState(initialSearch);
   const [severityFilter, setSeverityFilter] = useState(initialSeverity);
   const [statusFilter, setStatusFilter] = useState(initialStatus);
   const [slaFilter, setSlaFilter] = useState(initialSla);
+  const [taskFilter, setTaskFilter] = useState(initialTaskId);
 
   const [tickets, setTickets] = useState([]);
   const [stats, setStats] = useState(null);
@@ -47,6 +49,7 @@ export const useTickets = ({
       if (severityFilter !== 'all') params.severity = severityFilter.toLowerCase();
       if (statusFilter !== 'all') params.status = statusFilter.toLowerCase();
       if (slaFilter !== 'all') params.sla = slaFilter.toLowerCase();
+      if (taskFilter && taskFilter !== 'all') params.task_id = taskFilter;
 
       const [statsData, ticketsData] = await Promise.all([
         ticketsService.getStats().catch((err) => {
@@ -82,7 +85,7 @@ export const useTickets = ({
       setLoading(false);
       setIsRetrying(false);
     }
-  }, [search, severityFilter, statusFilter, slaFilter]);
+  }, [search, severityFilter, statusFilter, slaFilter, taskFilter]);
 
   useEffect(() => {
     fetchTicketsData();
@@ -273,6 +276,7 @@ export const useTickets = ({
     setSeverityFilter('all');
     setStatusFilter('all');
     setSlaFilter('all');
+    setTaskFilter('all');
   }, []);
 
   return {
@@ -294,6 +298,8 @@ export const useTickets = ({
     setStatusFilter,
     slaFilter,
     setSlaFilter,
+    taskFilter,
+    setTaskFilter,
     hasResolvedTickets,
     updateTicketStatus,
     fetchTicketsData,

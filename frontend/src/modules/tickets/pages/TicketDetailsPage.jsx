@@ -11,6 +11,7 @@ import { PassOrReassignModal } from '../components/PassOrReassignModal';
 import { HoldTicketModal } from '../components/HoldTicketModal';
 import { CloseTicketModal } from '../components/CloseTicketModal';
 import { ReopenTicketModal } from '../components/ReopenTicketModal';
+import { RelatedTaskCard } from '../components/RelatedTaskCard';
 
 export const TicketDetailsPage = () => {
   const { id } = useParams();
@@ -235,6 +236,14 @@ export const TicketDetailsPage = () => {
   const currentStatus = (ticket?.status || 'open').toLowerCase();
   const isAssignee = ticket?.assignee_id === currentUserId;
   const isUnassigned = !ticket?.assignee_id;
+  const canEditTicket = Boolean(
+    currentUser && (
+      isOwner ||
+      currentUser?.role?.toLowerCase() === 'admin' ||
+      isAssignee ||
+      ticket?.reporter_id === currentUserId
+    )
+  );
 
   // Latest handoff determination
   const latestHandoff = useMemo(() => {
@@ -981,6 +990,16 @@ export const TicketDetailsPage = () => {
 
           {/* RIGHT COLUMN: 4 Columns (Metadata, Artifacts, Audit Trail) */}
           <div className="lg:col-span-4 space-y-space-lg">
+            {/* Related Task Card */}
+            <RelatedTaskCard
+              ticket={ticket}
+              canEdit={canEditTicket}
+              onTicketUpdated={(updated) => {
+                setTicket(updated);
+                fetchTicket();
+              }}
+            />
+
             {/* Structured Metadata Card */}
             <div className="bg-surface-card rounded-xl p-space-lg shadow-sm space-y-space-md">
               <div className="flex items-center justify-between border-b border-border-subtle pb-space-sm">

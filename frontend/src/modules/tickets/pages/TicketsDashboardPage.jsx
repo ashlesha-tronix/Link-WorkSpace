@@ -6,6 +6,7 @@ import CreateTicketModal from '../components/CreateTicketModal';
 import { STATUS_CONFIG, SEVERITY_CONFIG } from '../constants/ticketConstants';
 import ErrorState from '../../design-system/components/ErrorState';
 import Avatar from '../../../components/common/Avatar';
+import { taskService } from '../../tasks/services/taskService';
 
 /**
  * Screen 61: Ticket Management Dashboard (Prompts 36 & 37)
@@ -20,6 +21,7 @@ export const TicketsDashboardPage = () => {
   const urlSla = searchParams.get('sla') || 'all';
   const urlStatus = searchParams.get('status') || 'all';
   const urlSeverity = searchParams.get('severity') || 'all';
+  const urlTaskId = searchParams.get('task_id') || 'all';
   const urlSearch = searchParams.get('search') || '';
 
   const {
@@ -37,6 +39,8 @@ export const TicketsDashboardPage = () => {
     setStatusFilter,
     slaFilter,
     setSlaFilter,
+    taskFilter,
+    setTaskFilter,
     hasResolvedTickets,
     refetch,
   } = useTickets({
@@ -44,10 +48,18 @@ export const TicketsDashboardPage = () => {
     initialSeverity: urlSeverity,
     initialStatus: urlStatus,
     initialSla: urlSla,
+    initialTaskId: urlTaskId,
   });
 
-  // Modal
+  // Modal & Workspace Tasks for filter
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [tasks, setTasks] = useState([]);
+
+  useEffect(() => {
+    taskService.list({ page_size: 100 })
+      .then((res) => setTasks(res?.items || []))
+      .catch((err) => console.warn('Failed to load tasks for ticket filter:', err));
+  }, []);
 
   const totalCount = stats?.total ?? 0;
   const hasTotal = totalCount > 0;
@@ -76,6 +88,8 @@ export const TicketsDashboardPage = () => {
     if (st !== statusFilter) setStatusFilter(st);
     const sev = searchParams.get('severity') || 'all';
     if (sev !== severityFilter) setSeverityFilter(sev);
+    const tk = searchParams.get('task_id') || 'all';
+    if (tk !== taskFilter) setTaskFilter(tk);
     const q = searchParams.get('search') || '';
     if (q !== search) setSearch(q);
   }, [searchParams]);
@@ -111,6 +125,11 @@ export const TicketsDashboardPage = () => {
     updateUrlParams({ status: val });
   };
 
+  const handleTaskChange = (val) => {
+    setTaskFilter(val);
+    updateUrlParams({ task_id: val });
+  };
+
   return (
     <div className="p-space-lg max-w-7xl mx-auto w-full space-y-space-lg">
       {/* View Switcher Header & Toolbar */}
@@ -121,6 +140,9 @@ export const TicketsDashboardPage = () => {
         onSeverityChange={handleSeverityChange}
         statusFilter={statusFilter}
         onStatusChange={handleStatusChange}
+        taskFilter={taskFilter}
+        onTaskChange={handleTaskChange}
+        tasks={tasks}
         onOpenCreateModal={() => setShowCreateModal(true)}
         isWsConnected={isWsConnected}
         hasResolvedTickets={hasResolvedTickets}
@@ -379,7 +401,7 @@ export const TicketsDashboardPage = () => {
       </div>
 
       {/* Active Filter Chips Bar */}
-      {(slaFilter === 'breached' || statusFilter !== 'all' || severityFilter !== 'all' || search.trim() !== '') && (
+      {(slaFilter === 'breached' || statusFilter !== 'all' || severityFilter !== 'all' || taskFilter !== 'all' || search.trim() !== '') && (
         <div className="flex flex-wrap items-center gap-2 pt-1" role="region" aria-label="Active Filters">
           <span className="font-label-sm text-label-sm text-text-muted">Active Filters:</span>
 
@@ -435,6 +457,26 @@ export const TicketsDashboardPage = () => {
             </span>
           )}
 
+          {taskFilter !== 'all' && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-canvas-lavender text-text-primary border border-border-subtle">
+              <span className="material-symbols-outlined text-xs text-primary">assignment</span>
+              <span>
+                Task: {tasks.find((t) => t.id === taskFilter)?.task_number || tasks.find((t) => t.id === taskFilter)?.title || taskFilter}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setTaskFilter('all');
+                  updateUrlParams({ task_id: 'all' });
+                }}
+                className="hover:bg-canvas-main rounded-full p-0.5 ml-0.5 transition-colors flex items-center justify-center"
+                aria-label="Remove task filter"
+              >
+                <span className="material-symbols-outlined text-xs">close</span>
+              </button>
+            </span>
+          )}
+
           {search.trim() !== '' && (
             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-canvas-lavender text-text-primary border border-border-subtle">
               <span>Search: "{search}"</span>
@@ -458,8 +500,9 @@ export const TicketsDashboardPage = () => {
               setSlaFilter('all');
               setStatusFilter('all');
               setSeverityFilter('all');
+              setTaskFilter('all');
               setSearch('');
-              updateUrlParams({ sla: 'all', status: 'all', severity: 'all', search: '' });
+              updateUrlParams({ sla: 'all', status: 'all', severity: 'all', task_id: 'all', search: '' });
             }}
             className="text-xs text-text-muted hover:text-text-primary underline ml-1 cursor-pointer"
           >
@@ -536,9 +579,24 @@ export const TicketsDashboardPage = () => {
                         </div>
                       </td>
 
-                      {/* Title */}
-                      <td className="py-3 px-4 font-semibold text-text-primary group-hover:text-primary transition-colors max-w-md truncate">
-                        {t.title}
+                      {/* Title & Task Chip */}
+                      <td className="py-3 px-4 font-semibold text-text-primary group-hover:text-primary transition-colors max-w-md">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="truncate">{t.title}</span>
+                          {t.task && (
+                            <span
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                navigate(`/workspace/tasks?task_id=${t.task.id}`);
+                              }}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium bg-canvas-lavender hover:bg-primary-fixed text-text-secondary hover:text-primary border border-border-subtle hover:border-primary transition-colors shrink-0"
+                              title={`Linked task: ${t.task.key} - ${t.task.title}`}
+                            >
+                              <span className="material-symbols-outlined text-[12px]">assignment</span>
+                              <span>{t.task.key}</span>
+                            </span>
+                          )}
+                        </div>
                       </td>
 
                       {/* Project Badge */}

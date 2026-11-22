@@ -120,6 +120,7 @@ export const TaskDetailDrawer = ({
   isOpen,
   onClose,
   task: initialTask,
+  initialTab = 'discussion',
   onUpdateTask,
   onDeleteTask,
 }) => {
@@ -132,7 +133,7 @@ export const TaskDetailDrawer = ({
   const [isDeletingTask, setIsDeletingTask] = useState(false);
 
   // Active drawer tab: 'discussion' | 'files' | 'activity' | 'tickets'
-  const [activeTab, setActiveTab] = useState('discussion');
+  const [activeTab, setActiveTab] = useState(initialTab || 'discussion');
 
   // Counts for tabs
   const [commentsCount, setCommentsCount] = useState(initialTask?.comment_count || 0);
@@ -165,7 +166,7 @@ export const TaskDetailDrawer = ({
   const canChangeStatus = Boolean(permissions.can_change_status);
   const canDelete = Boolean(permissions.can_delete);
 
-  // Sync initial task
+  // Sync initial task and tab
   useEffect(() => {
     if (initialTask) {
       setTask(initialTask);
@@ -176,7 +177,10 @@ export const TaskDetailDrawer = ({
       setIsEditingTitle(false);
       setErrorMessage(null);
     }
-  }, [initialTask]);
+    if (isOpen && initialTab) {
+      setActiveTab(initialTab);
+    }
+  }, [initialTask, isOpen, initialTab]);
 
   // Lock scroll and handle escape
   useEffect(() => {

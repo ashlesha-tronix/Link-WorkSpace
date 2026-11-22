@@ -98,9 +98,11 @@ export const taskService = {
 
   listLinkedTickets: async (taskId) => {
     try {
-      const res = await apiClient.get('/tickets');
-      const allTickets = Array.isArray(res.data) ? res.data : [];
-      return allTickets.filter((t) => t.task_id === taskId);
+      const res = await apiClient.get(`${BASE}/${taskId}/tickets`);
+      if (res.data?.items) return res.data.items;
+      if (Array.isArray(res.data)) return res.data;
+      const fallback = await apiClient.get('/tickets', { params: { task_id: taskId } });
+      return Array.isArray(fallback.data) ? fallback.data : fallback.data?.items || [];
     } catch {
       return [];
     }

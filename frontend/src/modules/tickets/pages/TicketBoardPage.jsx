@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTickets } from '../hooks/useTickets';
 import TicketViewSwitcher from '../components/TicketViewSwitcher';
@@ -6,6 +6,7 @@ import CreateTicketModal from '../components/CreateTicketModal';
 import { STATUS_CONFIG, SEVERITY_CONFIG, TICKET_STATUSES } from '../constants/ticketConstants';
 import ErrorState from '../../design-system/components/ErrorState';
 import Avatar from '../../../components/common/Avatar';
+import { taskService } from '../../tasks/services/taskService';
 
 /**
  * Screen 62: Ticket Board View (Prompt 38)
@@ -29,14 +30,23 @@ export const TicketBoardPage = () => {
     setSeverityFilter,
     statusFilter,
     setStatusFilter,
+    taskFilter,
+    setTaskFilter,
     hasResolvedTickets,
     updateTicketStatus,
     refetch,
   } = useTickets();
 
-  // Modal
+  // Modal & Workspace Tasks
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [draggedTicketId, setDraggedTicketId] = useState(null);
+  const [tasks, setTasks] = useState([]);
+
+  useEffect(() => {
+    taskService.list({ page_size: 100 })
+      .then((res) => setTasks(res?.items || []))
+      .catch((err) => console.warn('Failed to load tasks for board filter:', err));
+  }, []);
 
   const baseStatusKeys = [...TICKET_STATUSES];
   if (hasResolvedTickets || (boardTickets.resolved && boardTickets.resolved.length > 0)) {
@@ -82,6 +92,9 @@ export const TicketBoardPage = () => {
         onSeverityChange={setSeverityFilter}
         statusFilter={statusFilter}
         onStatusChange={setStatusFilter}
+        taskFilter={taskFilter}
+        onTaskChange={setTaskFilter}
+        tasks={tasks}
         onOpenCreateModal={() => setShowCreateModal(true)}
         isWsConnected={isWsConnected}
         hasResolvedTickets={hasResolvedTickets}
@@ -177,6 +190,23 @@ export const TicketBoardPage = () => {
                           <h3 className="font-headline-sm text-sm text-text-primary group-hover:text-primary transition-colors leading-snug font-semibold line-clamp-2">
                             {t.title}
                           </h3>
+
+                          {/* Task Chip */}
+                          {t.task && (
+                            <div className="pt-0.5">
+                              <span
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  navigate(`/workspace/tasks?task_id=${t.task.id}`);
+                                }}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium bg-canvas-lavender hover:bg-primary-fixed text-text-secondary hover:text-primary border border-border-subtle hover:border-primary transition-colors cursor-pointer"
+                                title={`Linked task: ${t.task.key} - ${t.task.title}`}
+                              >
+                                <span className="material-symbols-outlined text-[12px]">assignment</span>
+                                <span>{t.task.key}</span>
+                              </span>
+                            </div>
+                          )}
 
                           <div className="pt-space-xs flex items-center justify-between mt-auto border-t border-border-subtle/40">
                             <span className="px-1.5 py-0.5 rounded bg-primary-fixed text-primary font-mono text-xs font-bold">

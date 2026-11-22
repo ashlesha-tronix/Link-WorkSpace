@@ -3,6 +3,7 @@ import ticketsService from '../../../services/ticketsService';
 import projectsService from '../../../services/projectsService';
 import { taskService } from '../../tasks/services/taskService';
 import Modal from '../../design-system/components/Modal';
+import RelatedTaskSelect from './RelatedTaskSelect';
 
 /**
  * Screen 64: Create Ticket Modal (Prompt 40)
@@ -20,6 +21,7 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
   const [description, setDescription] = useState('');
   const [severity, setSeverity] = useState('');
   const [projectId, setProjectId] = useState(defaultProjectId || '');
+  const [taskId, setTaskId] = useState(defaultTaskId || '');
   const [assigneeId, setAssigneeId] = useState('');
   const [reporterId, setReporterId] = useState('');
   const [deadline, setDeadline] = useState('');
@@ -35,6 +37,7 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
     setDescription('');
     setSeverity('');
     setProjectId(defaultProjectId || '');
+    setTaskId(defaultTaskId || '');
     setAssigneeId('');
     setReporterId('');
     setDeadline('');
@@ -66,7 +69,7 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
   }, [isOpen]);
 
   const hasUnsavedChanges = Boolean(
-    title.trim() || description.trim() || severity || projectId || assigneeId || reporterId || deadline || initialComment.trim()
+    title.trim() || description.trim() || severity || projectId || taskId || assigneeId || reporterId || deadline || initialComment.trim()
   );
 
   const handleSubmit = async (e) => {
@@ -80,11 +83,13 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
       setSubmitting(true);
       setError(null);
 
+      const effectiveTaskId = taskId || defaultTaskId || undefined;
       const payload = {
         title: title.trim(),
         description: description.trim() || undefined,
         severity,
         project_id: projectId,
+        task_id: effectiveTaskId,
         assignee_id: assigneeId || undefined,
         reporter_id: reporterId || undefined,
         deadline: deadline ? new Date(deadline).toISOString() : undefined,
@@ -98,16 +103,6 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
           await ticketsService.addComment(newTicket.id, initialComment.trim());
         } catch (commentErr) {
           console.warn('Ticket created but initial comment failed:', commentErr);
-        }
-      }
-
-      // If defaultTaskId provided, link ticket to task
-      if (defaultTaskId && newTicket?.id) {
-        try {
-          await taskService.linkTicket(defaultTaskId, newTicket.id);
-          newTicket.task_id = defaultTaskId;
-        } catch (linkErr) {
-          console.warn('Ticket created but linking to task failed:', linkErr);
         }
       }
 
@@ -226,6 +221,18 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
               <option value="minor">Minor (P3)</option>
             </select>
           </div>
+        </div>
+
+        {/* Related Task (Optional) */}
+        <div>
+          <label className="font-label-sm text-label-sm text-text-muted uppercase tracking-wider block mb-1">
+            Related Task (Optional)
+          </label>
+          <RelatedTaskSelect
+            projectId={projectId}
+            selectedTaskId={taskId}
+            onChange={(newId) => setTaskId(newId)}
+          />
         </div>
 
         {/* Assignee & Reporter Row */}
