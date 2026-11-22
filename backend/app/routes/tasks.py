@@ -10,7 +10,7 @@ from typing import List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status, Request
-from sqlalchemy import select, func, desc, or_
+from sqlalchemy import select, func, desc, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +19,7 @@ from backend.app.dependencies import get_current_active_user
 from backend.app.models import (
     Task, Project, User, ProjectActivity, TaskComment, TaskAttachment,
     TaskActivity, Ticket, TicketActivity, TicketComment, TicketAttachment,
-    TicketHandoff, AuditLog
+    TicketHandoff, AuditLog, Membership
 )
 from backend.app.enums import TaskStatus, TaskPriority, TaskType
 from backend.app.core.websockets import ws_manager, authenticate_ws
@@ -405,9 +405,17 @@ async def create_task(
     # Validate assigner belongs to organization
     if assigner_id != current_user.id:
         assigner_res = await db.execute(
-            select(User).where(
+            select(User)
+            .outerjoin(Membership, Membership.user_id == User.id)
+            .where(
                 User.id == assigner_id,
-                User.organization_id == current_user.organization_id
+                or_(
+                    User.organization_id == current_user.organization_id,
+                    and_(
+                        Membership.organization_id == current_user.organization_id,
+                        Membership.status == "active",
+                    ),
+                ),
             )
         )
         if not assigner_res.scalars().first():
@@ -435,9 +443,17 @@ async def create_task(
     # Validate assignee belongs to organization
     if assignee_id and assignee_id != current_user.id:
         u_res = await db.execute(
-            select(User).where(
+            select(User)
+            .outerjoin(Membership, Membership.user_id == User.id)
+            .where(
                 User.id == assignee_id,
-                User.organization_id == current_user.organization_id
+                or_(
+                    User.organization_id == current_user.organization_id,
+                    and_(
+                        Membership.organization_id == current_user.organization_id,
+                        Membership.status == "active",
+                    ),
+                ),
             )
         )
         if not u_res.scalars().first():
@@ -511,6 +527,71 @@ async def create_task(
             created_at=now,
         )
         db.add(activity)
+
+    # Link related tickets in the same transaction if provided
+    target_ticket_ids = []
+    p_ticket_ids = getattr(payload, "ticket_ids", None)
+    p_ticket_id = getattr(payload, "ticket_id", None)
+    if p_ticket_ids:
+        target_ticket_ids.extend([tid for tid in p_ticket_ids if tid])
+    elif p_ticket_id:
+        target_ticket_ids.append(p_ticket_id)
+
+    target_ticket_ids = list(dict.fromkeys(target_ticket_ids))
+    if target_ticket_ids:
+        t_tickets_res = await db.execute(
+            select(Ticket)
+            .options(selectinload(Ticket.project))
+            .where(Ticket.id.in_(target_ticket_ids))
+        )
+        t_tickets = t_tickets_res.scalars().all()
+        found_ids = {t.id for t in t_tickets}
+        missing = set(target_ticket_ids) - found_ids
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"One or more referenced tickets not found: {list(missing)}"
+            )
+
+        for tick in t_tickets:
+            if not tick.project or tick.project.organization_id != current_user.organization_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Ticket {tick.ticket_number or tick.id} does not belong to your organization"
+                )
+            if new_task.project_id and tick.project_id and tick.project_id != new_task.project_id:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Ticket {tick.ticket_number or tick.id} belongs to a different project"
+                )
+            if not new_task.project_id and tick.project_id:
+                new_task.project_id = tick.project_id
+
+            tick.task_id = new_task.id
+
+            act_link = TaskActivity(
+                id=str(uuid4()),
+                task_id=new_task.id,
+                organization_id=current_user.organization_id,
+                actor_id=current_user.id,
+                action="ticket_linked",
+                field_name="task_id",
+                old_value=None,
+                new_value=tick.ticket_number,
+                meta={"ticket_id": tick.id, "ticket_number": tick.ticket_number, "ticket_title": tick.title},
+                created_at=now,
+            )
+            db.add(act_link)
+
+            tick_act = TicketActivity(
+                ticket_id=tick.id,
+                actor_id=current_user.id,
+                action="task_linked",
+                old_value=None,
+                new_value=new_task.task_number,
+                created_at=now,
+            )
+            db.add(tick_act)
 
     await db.commit()
 
@@ -733,9 +814,17 @@ async def update_task(
             )
         if target_assigner != current_user.id:
             assigner_res = await db.execute(
-                select(User).where(
+                select(User)
+                .outerjoin(Membership, Membership.user_id == User.id)
+                .where(
                     User.id == target_assigner,
-                    User.organization_id == current_user.organization_id
+                    or_(
+                        User.organization_id == current_user.organization_id,
+                        and_(
+                            Membership.organization_id == current_user.organization_id,
+                            Membership.status == "active",
+                        ),
+                    ),
                 )
             )
             if not assigner_res.scalars().first():
@@ -752,9 +841,17 @@ async def update_task(
         new_assignee_user = None
         if target_assignee != current_user.id:
             u_res = await db.execute(
-                select(User).where(
+                select(User)
+                .outerjoin(Membership, Membership.user_id == User.id)
+                .where(
                     User.id == target_assignee,
-                    User.organization_id == current_user.organization_id
+                    or_(
+                        User.organization_id == current_user.organization_id,
+                        and_(
+                            Membership.organization_id == current_user.organization_id,
+                            Membership.status == "active",
+                        ),
+                    ),
                 )
             )
             new_assignee_user = u_res.scalars().first()
@@ -1369,6 +1466,19 @@ async def link_ticket(
     ticket = tick_res.scalars().first()
     if not ticket or (ticket.project and ticket.project.organization_id != current_user.organization_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
+
+    # If task has a project, ticket must belong to the same project
+    if task.project_id and ticket.project_id and ticket.project_id != task.project_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Ticket must belong to the same project as the task"
+        )
+    if not task.project_id and ticket.project_id:
+        task.project_id = ticket.project_id
+
+    # If already linked to this task, return early
+    if ticket.task_id == task.id:
+        return {"status": "ok", "message": "Ticket already linked to this task", "task_id": task.id, "ticket_id": ticket.id}
 
     ticket.task_id = task.id
     now = datetime.now(timezone.utc)

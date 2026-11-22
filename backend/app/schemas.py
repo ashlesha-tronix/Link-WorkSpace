@@ -523,11 +523,16 @@ class TaskCreate(BaseSchema):
     description: Optional[str] = None
     status: Optional[str] = "to_do"
     priority: Optional[str] = "medium"
+    task_type: Optional[str] = "feature"
+    story_points: Optional[int] = None
+    due_date: Optional[datetime] = None
     project_id: Optional[str] = None
     assigned_to_id: Optional[str] = None
     assignee_id: Optional[str] = None
     reporter_id: Optional[str] = None
     assigner_id: Optional[str] = None
+    ticket_id: Optional[str] = None
+    ticket_ids: Optional[List[str]] = None
 
 
 class TaskUpdate(BaseSchema):

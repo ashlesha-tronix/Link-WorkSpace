@@ -129,6 +129,8 @@ class TaskCreate(BaseSchema):
     assigned_to_id: Optional[str] = None
     reporter_id: Optional[str] = None
     assigner_id: Optional[str] = None
+    ticket_id: Optional[str] = None
+    ticket_ids: Optional[List[str]] = None
 
     @model_validator(mode="after")
     def sync_assignee(self):
@@ -163,6 +165,8 @@ class TaskUpdate(BaseSchema):
     assigned_to_id: Optional[str] = None
     reporter_id: Optional[str] = None
     assigner_id: Optional[str] = None
+    ticket_id: Optional[str] = None
+    ticket_ids: Optional[List[str]] = None
 
     @model_validator(mode="after")
     def sync_assignee(self):
@@ -208,6 +212,8 @@ class TaskRead(BaseSchema):
     assigned_to_id: Optional[str] = None
     reporter_id: Optional[str] = None
     assigner_id: Optional[str] = None
+    ticket_id: Optional[str] = None
+    ticket_ids: Optional[List[str]] = None
     organization_id: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
