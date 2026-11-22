@@ -81,6 +81,41 @@ export const taskService = {
     return res.data;
   },
 
+  deleteAttachment: async (taskId, attachmentId) => {
+    await apiClient.delete(`${BASE}/${taskId}/attachments/${attachmentId}`);
+  },
+
+  getActivity: async (taskId, page = 1, pageSize = 20) => {
+    try {
+      const res = await apiClient.get(`${BASE}/${taskId}/activity`, {
+        params: { page, page_size: pageSize },
+      });
+      return res.data;
+    } catch {
+      return { items: [], total: 0, page, page_size: pageSize };
+    }
+  },
+
+  listLinkedTickets: async (taskId) => {
+    try {
+      const res = await apiClient.get('/tickets');
+      const allTickets = Array.isArray(res.data) ? res.data : [];
+      return allTickets.filter((t) => t.task_id === taskId);
+    } catch {
+      return [];
+    }
+  },
+
+  linkTicket: async (taskId, ticketId) => {
+    const res = await apiClient.post(`${BASE}/${taskId}/tickets/${ticketId}`);
+    return res.data;
+  },
+
+  unlinkTicket: async (taskId, ticketId) => {
+    const res = await apiClient.delete(`${BASE}/${taskId}/tickets/${ticketId}`);
+    return res.data;
+  },
+
   getEnums: async () => {
     try {
       const res = await apiClient.get(`${BASE}/meta/enums`);

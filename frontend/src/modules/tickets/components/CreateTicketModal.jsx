@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import ticketsService from '../../../services/ticketsService';
 import projectsService from '../../../services/projectsService';
+import { taskService } from '../../tasks/services/taskService';
 import Modal from '../../design-system/components/Modal';
 
 /**
@@ -13,7 +14,7 @@ import Modal from '../../design-system/components/Modal';
  * Dropdowns have no selection (empty string/placeholder only).
  * Full state reset on open and close.
  */
-export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultProjectId }) => {
+export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultProjectId, defaultTaskId }) => {
   // Empty default state
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -97,6 +98,16 @@ export const CreateTicketModal = ({ isOpen, onClose, onTicketCreated, defaultPro
           await ticketsService.addComment(newTicket.id, initialComment.trim());
         } catch (commentErr) {
           console.warn('Ticket created but initial comment failed:', commentErr);
+        }
+      }
+
+      // If defaultTaskId provided, link ticket to task
+      if (defaultTaskId && newTicket?.id) {
+        try {
+          await taskService.linkTicket(defaultTaskId, newTicket.id);
+          newTicket.task_id = defaultTaskId;
+        } catch (linkErr) {
+          console.warn('Ticket created but linking to task failed:', linkErr);
         }
       }
 
