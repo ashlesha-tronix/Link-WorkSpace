@@ -568,6 +568,7 @@ class TicketBase(BaseSchema):
     rca_trigger: Optional[str] = None
     rca_mitigation: Optional[str] = None
     rca_action_items: Optional[str] = None
+    version: Optional[int] = 0
 
 
 class TicketCreate(BaseSchema):
@@ -754,6 +755,7 @@ class TicketRead(TicketBase):
     id: str
     ticket_number: str
     project_id: str
+    version: Optional[int] = 0
     assignee_id: Optional[str] = None
     reporter_id: Optional[str] = None
     created_at: datetime

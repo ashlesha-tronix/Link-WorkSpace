@@ -225,7 +225,7 @@ class TicketComment(Base):
 
     ticket: Mapped["Ticket"] = relationship(back_populates="comments")
     author: Mapped["User"] = relationship("User")
-    attachments: Mapped[list["TicketAttachment"]] = relationship("TicketAttachment", back_populates="comment")
+    attachments: Mapped[list["TicketAttachment"]] = relationship("TicketAttachment", back_populates="comment", lazy="selectin")
 
 
 class TicketAttachment(Base):
@@ -285,8 +285,8 @@ class TicketHandoff(Base):
     )
 
     ticket: Mapped["Ticket"] = relationship(back_populates="handoffs")
-    from_user: Mapped["User"] = relationship("User", foreign_keys=[from_user_id])
-    to_user: Mapped["User"] = relationship("User", foreign_keys=[to_user_id])
+    from_user: Mapped["User"] = relationship("User", foreign_keys=[from_user_id], lazy="selectin")
+    to_user: Mapped["User"] = relationship("User", foreign_keys=[to_user_id], lazy="selectin")
 
 
 class TicketActivity(Base):

@@ -34,14 +34,18 @@ export const TicketDetailsPage = () => {
   const [isVerifyCloseModalOpen, setIsVerifyCloseModalOpen] = useState(false);
   const [isReopenModalOpen, setIsReopenModalOpen] = useState(false);
   const [actionError, setActionError] = useState(null);
+  const [isAccepting, setIsAccepting] = useState(false);
 
   const actionMenuRef = useRef(null);
   const severityMenuRef = useRef(null);
+  const isAcceptingRef = useRef(false);
 
   // Fetch Ticket Data
-  const fetchTicket = useCallback(async () => {
+  const fetchTicket = useCallback(async (isInitial = false) => {
     try {
-      setLoading(true);
+      if (isInitial) {
+        setLoading(true);
+      }
       setError(null);
       const data = await ticketsService.getTicket(id);
       setTicket(data);
@@ -55,7 +59,7 @@ export const TicketDetailsPage = () => {
   }, [id]);
 
   useEffect(() => {
-    fetchTicket();
+    fetchTicket(true);
   }, [fetchTicket]);
 
   // Close menus on outside click or Escape
@@ -91,7 +95,12 @@ export const TicketDetailsPage = () => {
       const orgId = user?.organization_id || localStorage.getItem('organization_id') || localStorage.getItem('active_workspace_id') || '';
       cleanup = wsFn(orgId, (event) => {
         const eventType = event?.type || event?.event;
-        const eventTicketId = event?.ticket_id || event?.ticket?.id || event?.data?.ticket_id;
+        const eventTicketId =
+          event?.ticket_id ||
+          event?.ticket?.id ||
+          event?.data?.ticket_id ||
+          event?.data?.ticket?.id ||
+          event?.data?.id;
         const relevantEvents = [
           'ticket_updated',
           'ticket_status_changed',
@@ -103,6 +112,9 @@ export const TicketDetailsPage = () => {
           'comment_added',
         ];
         if (relevantEvents.includes(eventType) && eventTicketId === id) {
+          if (event?.data?.ticket && event.data.ticket.id === id) {
+            setTicket(event.data.ticket);
+          }
           fetchTicket();
         }
       });
@@ -115,12 +127,25 @@ export const TicketDetailsPage = () => {
 
   // Action: Accept Ticket
   const handleAcceptTicket = async () => {
+    if (isAcceptingRef.current) return;
+    isAcceptingRef.current = true;
+    setIsAccepting(true);
     setIsActionMenuOpen(false);
     setActionError(null);
     try {
-      const updated = await ticketsService.acceptTicket(id, { version: ticket.version });
+      let currentVersion = ticket?.version;
+      if (currentVersion === undefined || currentVersion === null) {
+        const fresh = await ticketsService.getTicket(id);
+        if (fresh) {
+          setTicket(fresh);
+          currentVersion = fresh.version ?? 0;
+        } else {
+          currentVersion = 0;
+        }
+      }
+      const updated = await ticketsService.acceptTicket(id, { version: currentVersion });
       setTicket(updated);
-      fetchTicket();
+      await fetchTicket();
     } catch (err) {
       console.error('Accept ticket error:', err);
       const errMsg =
@@ -130,7 +155,10 @@ export const TicketDetailsPage = () => {
         err.message ||
         'Failed to accept ticket.';
       setActionError(errMsg);
-      fetchTicket();
+      await fetchTicket();
+    } finally {
+      isAcceptingRef.current = false;
+      setIsAccepting(false);
     }
   };
 
@@ -139,7 +167,8 @@ export const TicketDetailsPage = () => {
     setIsActionMenuOpen(false);
     setActionError(null);
     try {
-      const updated = await ticketsService.resumeTicket(id, { version: ticket.version });
+      const currentVersion = ticket?.version ?? 0;
+      const updated = await ticketsService.resumeTicket(id, { version: currentVersion });
       setTicket(updated);
       fetchTicket();
     } catch (err) {
@@ -207,11 +236,22 @@ export const TicketDetailsPage = () => {
   const isAssignee = ticket?.assignee_id === currentUserId;
   const isUnassigned = !ticket?.assignee_id;
 
+  // Latest handoff determination
+  const latestHandoff = useMemo(() => {
+    if (!ticket?.handoffs || ticket.handoffs.length === 0) return null;
+    return [...ticket.handoffs].sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+  }, [ticket?.handoffs]);
+
+  const intendedRecipientId = latestHandoff ? latestHandoff.to_user_id : ticket?.assignee_id;
+  const handoffSenderId = latestHandoff ? latestHandoff.from_user_id : null;
+  const isHandoffRecipient = Boolean(currentUserId && intendedRecipientId && currentUserId === intendedRecipientId);
+  const isHandoffSender = Boolean(currentUserId && handoffSenderId && currentUserId === handoffSenderId);
+
   // -------------------------------------------------------------------------
   // Lifecycle Rules & Tooltip Computations (Backend Alignment)
   // -------------------------------------------------------------------------
 
-  // 1. Accept ticket (open -> in_progress)
+  // 1. Accept ticket (open -> in_progress OR passed -> in_progress)
   let acceptEnabled = false;
   let acceptDisabledReason = '';
   if (currentStatus === 'open') {
@@ -220,10 +260,16 @@ export const TicketDetailsPage = () => {
     } else {
       acceptDisabledReason = `Assigned to ${ticket?.assignee?.full_name || 'another member'}. Only the assigned user or unassigned tickets can be accepted.`;
     }
+  } else if (currentStatus === 'passed') {
+    if (isHandoffRecipient) {
+      acceptEnabled = true;
+    } else if (isHandoffSender) {
+      acceptDisabledReason = 'You passed this ticket. Only the recipient can accept it.';
+    } else {
+      acceptDisabledReason = `Passed to ${ticket?.assignee?.full_name || 'another colleague'}. Only the recipient can accept this ticket.`;
+    }
   } else if (currentStatus === 'in_progress' || currentStatus === 'wip') {
     acceptDisabledReason = 'Ticket is already in progress.';
-  } else if (currentStatus === 'passed') {
-    acceptDisabledReason = 'Ticket is currently passed. Resume work to take active ownership.';
   } else if (currentStatus === 'on_hold') {
     acceptDisabledReason = 'Ticket is currently on hold. Resume work to proceed.';
   } else if (currentStatus === 'closed') {
@@ -244,7 +290,7 @@ export const TicketDetailsPage = () => {
   } else if (currentStatus === 'open') {
     passDisabledReason = "You can't pass an open ticket. Accept it into in-progress first.";
   } else if (currentStatus === 'passed') {
-    passDisabledReason = 'Ticket is already passed to a colleague. The recipient must resume work first.';
+    passDisabledReason = 'Ticket is already passed to a colleague. The recipient must accept it first.';
   } else if (currentStatus === 'on_hold') {
     passDisabledReason = 'Resume this ticket from hold before passing it to a colleague.';
   } else if (currentStatus === 'closed') {
@@ -267,28 +313,24 @@ export const TicketDetailsPage = () => {
   } else if (currentStatus === 'open') {
     holdDisabledReason = 'Only in-progress tickets can be placed on hold.';
   } else if (currentStatus === 'passed') {
-    holdDisabledReason = 'Passed tickets must be resumed before placing on hold.';
+    holdDisabledReason = 'Passed tickets must be accepted before placing on hold.';
   } else if (currentStatus === 'closed') {
     holdDisabledReason = 'Cannot place a closed ticket on hold.';
   } else if (currentStatus === 'resolved') {
     holdDisabledReason = 'Cannot place a resolved ticket on hold.';
   }
 
-  // 4. Resume (passed -> in_progress: only recipient; on_hold -> in_progress: only assignee)
+  // 4. Resume (on_hold -> in_progress: only assignee)
   let resumeEnabled = false;
   let resumeDisabledReason = '';
-  if (currentStatus === 'passed') {
-    if (isAssignee) {
-      resumeEnabled = true;
-    } else {
-      resumeDisabledReason = `Passed to ${ticket?.assignee?.full_name || 'another colleague'}. Only they can resume work.`;
-    }
-  } else if (currentStatus === 'on_hold') {
+  if (currentStatus === 'on_hold') {
     if (isAssignee) {
       resumeEnabled = true;
     } else {
       resumeDisabledReason = 'Only the assigned user can resume work from on hold.';
     }
+  } else if (currentStatus === 'passed') {
+    resumeDisabledReason = 'Passed tickets must be accepted by the recipient, not resumed.';
   } else if (currentStatus === 'in_progress' || currentStatus === 'wip') {
     resumeDisabledReason = 'Ticket is already in progress.';
   } else if (currentStatus === 'open') {
@@ -302,8 +344,8 @@ export const TicketDetailsPage = () => {
   // 5. Verify & close (Owner only, shown only when passed to owner or held by owner in progress)
   const isVerifyCloseEligible =
     isOwner &&
-    ((currentStatus === 'passed' && isAssignee) ||
-      ((currentStatus === 'in_progress' || currentStatus === 'wip') && isAssignee));
+    ((currentStatus === 'passed' && (isAssignee || isHandoffRecipient)) ||
+      (currentStatus === 'in_progress' || currentStatus === 'wip'));
 
   // 6. Close ticket (Owner only, shown when not eligible for Verify & close)
   let closeEnabled = false;
@@ -314,9 +356,12 @@ export const TicketDetailsPage = () => {
     closeDisabledReason = 'Ticket is already closed.';
   } else if (currentStatus === 'resolved') {
     closeEnabled = true; // Legacy resolved tickets can be closed by owner
+  } else if (currentStatus === 'open') {
+    closeDisabledReason =
+      'Cannot close an open ticket. Ticket must be in progress or passed to the owner before closing.';
   } else if (!isVerifyCloseEligible) {
     closeDisabledReason =
-      'Owner can only close a ticket when it is passed to you or held by you in progress.';
+      'Owner can only close a ticket when it is passed to you or in progress.';
   } else {
     closeEnabled = true;
   }
@@ -464,10 +509,11 @@ export const TicketDetailsPage = () => {
             {acceptEnabled && (
               <button
                 onClick={handleAcceptTicket}
-                className="h-8 px-3 rounded-lg bg-surface-card hover:bg-canvas-lavender text-text-primary font-label-sm text-label-sm shadow-sm transition-colors flex items-center gap-1.5"
+                disabled={isAccepting}
+                className="h-8 px-3 rounded-lg bg-surface-card hover:bg-canvas-lavender text-text-primary font-label-sm text-label-sm shadow-sm transition-colors flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <span className="material-symbols-outlined text-sm text-severity-blocker">notifications_active</span>
-                <span>Acknowledge &amp; Accept</span>
+                <span>{isAccepting ? 'Accepting...' : 'Acknowledge & Accept'}</span>
               </button>
             )}
           </div>
@@ -567,10 +613,10 @@ export const TicketDetailsPage = () => {
 
                     {/* Accept ticket */}
                     {renderActionItem({
-                      label: 'Accept ticket',
+                      label: isAccepting ? 'Accepting ticket...' : 'Accept ticket',
                       icon: 'check_circle',
-                      enabled: acceptEnabled,
-                      disabledReason: acceptDisabledReason,
+                      enabled: acceptEnabled && !isAccepting,
+                      disabledReason: isAccepting ? 'Accepting ticket in progress...' : acceptDisabledReason,
                       onClick: handleAcceptTicket,
                     })}
 
@@ -1080,7 +1126,6 @@ export const TicketDetailsPage = () => {
         }}
         onError={(msg) => {
           setActionError(msg);
-          fetchTicket();
         }}
       />
 
@@ -1096,7 +1141,6 @@ export const TicketDetailsPage = () => {
         }}
         onError={(msg) => {
           setActionError(msg);
-          fetchTicket();
         }}
       />
 

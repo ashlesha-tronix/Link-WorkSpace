@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Modal } from '../../../components/common/Modal';
 import { membersService } from '../../../services/membersService';
+import { projectsService } from '../../../services/projectsService';
 import { ticketsService } from '../../../services/ticketsService';
 import { authService } from '../../../services/api';
 import { PRESENCE_CONFIG, PRESENCE_STATUS } from '../../../constants/presence';
@@ -36,11 +37,63 @@ export const PassOrReassignModal = ({
   const dropZoneRef = useRef(null);
 
   const currentUser = authService.getCurrentUserSync();
-  const currentUserId = currentUser?.id;
+  const currentUserId = currentUser?.id || currentUser?.sub;
 
-  // Reset modal state when opening
+  const prevIsOpenRef = useRef(false);
+  const prevTicketIdRef = useRef(ticket?.id);
+  const latestTicketRef = useRef(ticket);
+
   useEffect(() => {
-    if (isOpen && ticket) {
+    latestTicketRef.current = ticket;
+  }, [ticket]);
+
+  const fetchMembers = useCallback(async () => {
+    setLoadingMembers(true);
+    setLocalError(null);
+    try {
+      let data = await membersService.listMembers();
+      let list = Array.isArray(data) ? data : (data?.users || data?.items || data?.members || data?.data || []);
+      if (!list || list.length === 0) {
+        try {
+          const fallbackData = await projectsService.getUsers();
+          const fallbackList = Array.isArray(fallbackData)
+            ? fallbackData
+            : (fallbackData?.users || fallbackData?.items || fallbackData?.members || fallbackData?.data || []);
+          if (fallbackList && fallbackList.length > 0) {
+            list = fallbackList;
+          }
+        } catch {
+          // keep original list
+        }
+      }
+      setMembers(list);
+    } catch (err) {
+      console.error('Failed to load members via membersService, trying fallback:', err);
+      try {
+        const fallbackData = await projectsService.getUsers();
+        const fallbackList = Array.isArray(fallbackData)
+          ? fallbackData
+          : (fallbackData?.users || fallbackData?.items || fallbackData?.members || fallbackData?.data || []);
+        if (fallbackList && fallbackList.length > 0) {
+          setMembers(fallbackList);
+          return;
+        }
+      } catch (fbErr) {
+        console.error('Fallback member fetch also failed:', fbErr);
+      }
+      setLocalError('Failed to load active organization members.');
+    } finally {
+      setLoadingMembers(false);
+    }
+  }, []);
+
+  // Reset modal state only when opening from closed state or when ticket ID changes
+  useEffect(() => {
+    const isNowOpen = Boolean(isOpen);
+    const wasOpen = prevIsOpenRef.current;
+    const ticketIdChanged = ticket?.id && ticket?.id !== prevTicketIdRef.current;
+
+    if (isNowOpen && (!wasOpen || ticketIdChanged)) {
       setSearchQuery('');
       setSelectedUserId('');
       setMessage('');
@@ -48,30 +101,21 @@ export const PassOrReassignModal = ({
       setLocalError(null);
       setSubmitting(false);
 
-      // Fetch organization members
-      setLoadingMembers(true);
-      membersService.listMembers()
-        .then((data) => {
-          const list = Array.isArray(data) ? data : (data?.users || data?.items || []);
-          setMembers(list);
-        })
-        .catch((err) => {
-          console.error('Failed to load members:', err);
-          setLocalError('Failed to load active organization members.');
-        })
-        .finally(() => {
-          setLoadingMembers(false);
-        });
+      fetchMembers();
     }
-  }, [isOpen, ticket]);
+
+    prevIsOpenRef.current = isNowOpen;
+    prevTicketIdRef.current = ticket?.id;
+  }, [isOpen, ticket?.id, fetchMembers]);
 
   // Filter members
   const filteredMembers = useMemo(() => {
     return members.filter((m) => {
       // Must be active and not suspended
-      if (m.is_active === false || m.status === 'suspended') return false;
+      if (m.is_active === false || m.status === 'suspended' || m.account_state === 'inactive') return false;
       // If pass mode: cannot pass to self
-      if (mode === 'pass' && m.id === currentUserId) return false;
+      const memberId = m.id || m.user_id;
+      if (mode === 'pass' && currentUserId && memberId === currentUserId) return false;
       // Search query filter
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
@@ -123,7 +167,7 @@ export const PassOrReassignModal = ({
         prev.map((f) => (f.id === fileItem.id ? { ...f, status: 'error', progress: 0, error: msg } : f))
       );
     }
-  }, [ticket]);
+  }, [ticket?.id]);
 
   const handleFilesAdded = useCallback((fileList) => {
     if (!fileList || fileList.length === 0) return;
@@ -200,13 +244,14 @@ export const PassOrReassignModal = ({
       .map((f) => f.attachmentId);
 
     try {
+      const currentVersion = latestTicketRef.current?.version ?? ticket?.version;
       let updatedTicket;
       if (mode === 'pass') {
         updatedTicket = await ticketsService.passTicket(ticket.id, {
           to_user_id: selectedUserId,
           message: trimmedMessage,
           attachment_ids: successfulAttachmentIds.length > 0 ? successfulAttachmentIds : undefined,
-          version: ticket.version,
+          version: currentVersion,
         });
       } else {
         // mode === 'reassign'
@@ -214,7 +259,7 @@ export const PassOrReassignModal = ({
           assignee_id: selectedUserId,
           message: trimmedMessage,
           attachment_ids: successfulAttachmentIds.length > 0 ? successfulAttachmentIds : undefined,
-          version: ticket.version,
+          version: currentVersion,
         });
       }
 
@@ -299,19 +344,29 @@ export const PassOrReassignModal = ({
           <div
             role="alert"
             aria-live="polite"
-            className="p-3 rounded-lg bg-error-container text-on-error-container font-body-sm text-body-sm flex items-start gap-2"
+            className="p-3 rounded-lg bg-error-container text-on-error-container font-body-sm text-body-sm flex items-start justify-between gap-2"
           >
-            <span className="material-symbols-outlined text-base shrink-0 mt-0.5">error</span>
-            <div className="flex-1">
+            <div className="flex items-start gap-2">
+              <span className="material-symbols-outlined text-base shrink-0 mt-0.5">error</span>
               <p className="font-semibold">{localError}</p>
             </div>
-            <button
-              onClick={() => setLocalError(null)}
-              className="text-text-muted hover:text-text-primary text-xs"
-              aria-label="Dismiss error"
-            >
-              <span className="material-symbols-outlined text-sm">close</span>
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={fetchMembers}
+                className="px-2 py-0.5 rounded bg-error/20 hover:bg-error/30 text-xs font-semibold underline cursor-pointer"
+              >
+                Retry
+              </button>
+              <button
+                type="button"
+                onClick={() => setLocalError(null)}
+                className="text-text-muted hover:text-text-primary text-xs"
+                aria-label="Dismiss error"
+              >
+                <span className="material-symbols-outlined text-sm">close</span>
+              </button>
+            </div>
           </div>
         )}
 
@@ -531,7 +586,12 @@ export const PassOrReassignModal = ({
               type="file"
               multiple
               className="hidden"
-              onChange={(e) => handleFilesAdded(e.target.files)}
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  handleFilesAdded(e.target.files);
+                }
+                e.target.value = '';
+              }}
             />
           </div>
 

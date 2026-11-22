@@ -18,7 +18,7 @@ from fastapi import (
     status,
 )
 from sqlalchemy import select, and_, or_, desc, func, update
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, noload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from backend.app.core.config import settings
@@ -42,6 +42,7 @@ from backend.app.models import (
 from backend.app.enums import TicketStatus
 from fastapi.responses import FileResponse
 from backend.app.schemas import (
+    UserRead,
     TicketCreate,
     TicketUpdate,
     TicketStatusChangeRequest,
@@ -205,7 +206,19 @@ async def get_ticket_stats(
     db: AsyncSession = Depends(get_db)
 ):
     """Screen 61: Summary counts for dashboard stat cards."""
-    query = select(Ticket).join(Ticket.project).where(Project.organization_id == current_user.organization_id)
+    query = (
+        select(Ticket)
+        .options(
+            noload(Ticket.comments),
+            noload(Ticket.attachments),
+            noload(Ticket.activities),
+            noload(Ticket.handoffs),
+            noload(Ticket.assignee),
+            noload(Ticket.reporter),
+        )
+        .join(Ticket.project)
+        .where(Project.organization_id == current_user.organization_id)
+    )
     if project_id and project_id.lower() != "all":
         query = query.where(Ticket.project_id == project_id)
 
@@ -274,8 +287,11 @@ async def get_filtered_tickets_query(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         )
         .join(Ticket.project)
         .where(Project.organization_id == organization_id)
@@ -291,8 +307,12 @@ async def get_filtered_tickets_query(
     norm_status = normalize_ticket_status(status)
     if norm_status == "active":
         query = query.where(Ticket.status.notin_(["resolved", "closed"]))
+    elif norm_status in ("wip", "in_progress"):
+        query = query.where(Ticket.status.in_(["wip", "in_progress", "inprogress", "in-progress"]))
+    elif norm_status in ("on_hold",):
+        query = query.where(Ticket.status.in_(["on_hold", "onhold", "on-hold"]))
     elif norm_status:
-        query = query.where(Ticket.status == norm_status)
+        query = query.where(func.lower(Ticket.status) == norm_status)
 
     if assignee_id and assignee_id.lower() != "all":
         query = query.where(Ticket.assignee_id == assignee_id)
@@ -568,8 +588,11 @@ async def create_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == new_ticket.id)
     )
     out_obj = res.scalars().first()
@@ -608,6 +631,7 @@ async def get_ticket_details(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
             selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
@@ -725,8 +749,11 @@ async def update_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = res.scalars().first()
@@ -965,7 +992,15 @@ def validate_file_content(content: bytes, ext: str) -> str:
 async def _get_authorized_ticket(ticket_id: str, current_user: User, db: AsyncSession) -> Ticket:
     """Verifies ticket existence and server-side organization authorization from verified membership."""
     res = await db.execute(
-        select(Ticket).options(selectinload(Ticket.project)).where(
+        select(Ticket)
+        .options(
+            selectinload(Ticket.project),
+            noload(Ticket.comments),
+            noload(Ticket.attachments),
+            noload(Ticket.activities),
+            noload(Ticket.handoffs),
+        )
+        .where(
             or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id)
         )
     )
@@ -1680,8 +1715,11 @@ async def change_ticket_status(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -1753,8 +1791,11 @@ async def change_ticket_severity(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -1843,8 +1884,11 @@ async def reassign_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -1910,8 +1954,11 @@ async def change_ticket_deadline(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -1940,21 +1987,56 @@ async def accept_ticket(
     """
     1. open -> in_progress:
        The assignee accepts, or any member claims an unassigned ticket (sets assignee).
+    2. passed -> in_progress:
+       Only the intended recipient of the handoff can accept the ticket.
     """
     ticket = await _get_authorized_ticket(ticket_id, current_user, db)
     old_status = ticket.status.lower()
 
-    if old_status != "open":
+    if old_status not in ("open", "passed"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "invalid_transition", "message": f"Cannot accept ticket in '{ticket.status}' status. Only open tickets can be accepted."}
+            detail={"code": "invalid_transition", "message": f"Cannot accept ticket in '{ticket.status}' status. Only open or passed tickets can be accepted."}
         )
 
-    if ticket.assignee_id and ticket.assignee_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "not_assignee", "message": "Only the assigned user can accept this ticket."}
+    sender_id = None
+    if old_status == "passed":
+        # Look up the latest handoff to determine the intended recipient and original sender
+        h_res = await db.execute(
+            select(TicketHandoff)
+            .where(TicketHandoff.ticket_id == ticket.id)
+            .order_by(desc(TicketHandoff.created_at))
         )
+        latest_handoff = h_res.scalars().first()
+        intended_recipient_id = latest_handoff.to_user_id if latest_handoff else ticket.assignee_id
+        sender_id = latest_handoff.from_user_id if latest_handoff else None
+
+        if not intended_recipient_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "no_handoff_recipient", "message": "No intended recipient found for this handoff."}
+            )
+
+        if current_user.id != intended_recipient_id:
+            if sender_id and current_user.id == sender_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"code": "sender_cannot_accept", "message": "You cannot accept a ticket that you passed. The recipient must accept it."}
+                )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "not_handoff_recipient", "message": "Only the intended recipient of this handoff can accept this ticket."}
+            )
+
+        new_assignee_id = current_user.id
+    else:
+        # old_status == "open"
+        if ticket.assignee_id and ticket.assignee_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "not_assignee", "message": "Only the assigned user can accept this ticket."}
+            )
+        new_assignee_id = ticket.assignee_id or current_user.id
 
     current_v = ticket.version or 0
     if payload and payload.version is not None and payload.version != current_v:
@@ -1963,7 +2045,6 @@ async def accept_ticket(
             detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
         )
 
-    new_assignee_id = ticket.assignee_id or current_user.id
     new_v = current_v + 1
     now = datetime.now(timezone.utc)
 
@@ -1982,7 +2063,7 @@ async def accept_ticket(
         ticket_id=ticket.id,
         actor_id=current_user.id,
         action="accepted",
-        old_value="open",
+        old_value=old_status,
         new_value=f"in_progress (Assignee: {current_user.full_name or current_user.email})",
         created_at=now,
     )
@@ -1998,11 +2079,16 @@ async def accept_ticket(
             "kind": "accept",
             "actor_id": current_user.id,
             "assignee_id": new_assignee_id,
-            "old_status": "open",
+            "old_status": old_status,
             "new_status": "in_progress",
         })
     )
     db.add(audit)
+
+    notif_recipients = [ticket.reporter_id]
+    if old_status == "passed" and sender_id and sender_id not in notif_recipients:
+        notif_recipients.append(sender_id)
+    notif_recipients = [uid for uid in notif_recipients if uid and uid != current_user.id]
 
     await _send_transition_notifications(
         db=db,
@@ -2011,7 +2097,7 @@ async def accept_ticket(
         action="accepted",
         title="Ticket Accepted",
         body=f"{current_user.full_name or current_user.email} accepted ticket {ticket.ticket_number}",
-        recipient_ids=[ticket.reporter_id],
+        recipient_ids=notif_recipients,
     )
 
     await db.commit()
@@ -2022,8 +2108,11 @@ async def accept_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -2218,8 +2307,11 @@ async def pass_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -2342,8 +2434,11 @@ async def hold_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -2367,18 +2462,17 @@ async def resume_ticket(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    3. passed -> in_progress: only the person it was passed to.
-    4. on_hold -> in_progress: only the assignee.
+    on_hold -> in_progress: only the assignee.
+    (passed tickets must use /accept to ensure explicit acceptance by the recipient).
     """
     ticket = await _get_authorized_ticket(ticket_id, current_user, db)
     old_status = ticket.status.lower()
 
     if old_status == "passed":
-        if ticket.assignee_id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={"code": "not_assignee", "message": "Only the user this ticket was passed to can resume work."}
-            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "acceptance_required", "message": "Ticket is awaiting recipient acceptance. Please accept the ticket instead of resuming."}
+        )
     elif old_status == "on_hold":
         if ticket.assignee_id != current_user.id:
             raise HTTPException(
@@ -2388,7 +2482,7 @@ async def resume_ticket(
     else:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "invalid_transition", "message": f"Cannot resume ticket in '{ticket.status}' status. Only passed or on-hold tickets can be resumed."}
+            detail={"code": "invalid_transition", "message": f"Cannot resume ticket in '{ticket.status}' status. Only on-hold tickets can be resumed."}
         )
 
     current_v = ticket.version or 0
@@ -2455,8 +2549,11 @@ async def resume_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -2498,10 +2595,10 @@ async def close_ticket(
 
     old_status = ticket.status.lower()
     is_passed_to_owner = (old_status == "passed" and ticket.assignee_id == current_user.id)
-    is_owner_in_progress = (old_status in ("in_progress", "wip") and ticket.assignee_id == current_user.id)
+    is_active_in_progress = (old_status in ("in_progress", "wip"))
     is_resolved = (old_status == "resolved")
 
-    if not (is_passed_to_owner or is_owner_in_progress or is_resolved):
+    if not (is_passed_to_owner or is_active_in_progress or is_resolved):
         if old_status == "open":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -2511,11 +2608,6 @@ async def close_ticket(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "not_passed_to_owner", "message": "Owner can only close a passed ticket if it is currently passed to the owner."}
-            )
-        elif old_status in ("in_progress", "wip") and ticket.assignee_id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "owner_not_assignee", "message": "Owner can only close an in-progress ticket if the owner is the active assignee."}
             )
         elif old_status == "closed":
             raise HTTPException(
@@ -2599,8 +2691,11 @@ async def close_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -2714,8 +2809,11 @@ async def reopen_ticket(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()
@@ -2906,8 +3004,11 @@ async def reassign_ticket_endpoint(
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(Ticket.id == ticket.id)
     )
     out_obj = refreshed.scalars().first()

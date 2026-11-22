@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ticketsService } from '../../../services/ticketsService';
 
 export const CloseTicketModal = ({
@@ -14,6 +14,7 @@ export const CloseTicketModal = ({
   const [prReference, setPrReference] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const submittingRef = useRef(false);
 
   useEffect(() => {
     if (isOpen && ticket) {
@@ -22,13 +23,17 @@ export const CloseTicketModal = ({
       setPrReference('');
       setError(null);
       setSubmitting(false);
+      submittingRef.current = false;
     }
   }, [isOpen, ticket, isVerifyClose]);
 
   if (!isOpen || !ticket) return null;
 
   const handleSubmit = async (e) => {
-    e.preventDefault();
+    e?.preventDefault?.();
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+
     const summary = resolutionSummary.trim() || (isVerifyClose ? 'Verified and closed by organization owner.' : '');
 
     setSubmitting(true);
@@ -45,7 +50,7 @@ export const CloseTicketModal = ({
         verified_by: isVerifyClose ? 'Owner Verified' : 'Reporter',
         pr_or_commit: prOrCommit || undefined,
         operational_signoff: true,
-        version: ticket.version,
+        version: ticket.version ?? 0,
       };
 
       const updated = await ticketsService.closeTicket(ticket.id, payload);
@@ -62,6 +67,7 @@ export const CloseTicketModal = ({
       setError(errMsg);
       onError?.(errMsg);
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -181,7 +187,11 @@ export const CloseTicketModal = ({
             type="button"
             onClick={handleSubmit}
             disabled={submitting}
-            className="h-10 px-space-lg bg-status-closed text-white font-label-md text-label-md rounded-lg flex items-center gap-1.5 shadow-sm transition-colors font-semibold disabled:opacity-50"
+            className={`h-10 px-space-lg font-label-md text-label-md rounded-lg flex items-center gap-1.5 shadow-sm transition-all font-semibold cursor-pointer ${
+              isVerifyClose
+                ? 'bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white'
+                : 'bg-btn-primary hover:bg-btn-primary/90 text-on-primary'
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
           >
             <span className="material-symbols-outlined text-base">check_circle</span>
             <span>{submitting ? 'Closing...' : isVerifyClose ? 'Verify & Close' : 'Close Ticket'}</span>
