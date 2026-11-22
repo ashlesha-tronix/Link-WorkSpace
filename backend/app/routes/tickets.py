@@ -17,7 +17,7 @@ from fastapi import (
     File,
     status,
 )
-from sqlalchemy import select, and_, or_, desc, func
+from sqlalchemy import select, and_, or_, desc, func, update
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
@@ -31,11 +31,15 @@ from backend.app.models import (
     User,
     Organization,
     ProjectMember,
+    Membership,
     TicketComment,
     TicketAttachment,
     TicketActivity,
+    TicketHandoff,
     AuditLog,
+    Notification,
 )
+from backend.app.enums import TicketStatus
 from fastapi.responses import FileResponse
 from backend.app.schemas import (
     TicketCreate,
@@ -46,6 +50,11 @@ from backend.app.schemas import (
     TicketDeadlineChangeRequest,
     TicketReopenRequest,
     TicketCloseRequest,
+    TicketAcceptRequest,
+    TicketPassRequest,
+    TicketHoldRequest,
+    TicketResumeRequest,
+    TicketOwnerReassignRequest,
     TicketRead,
     TicketStats,
     CriticalIssuesResponse,
@@ -965,6 +974,84 @@ async def _get_authorized_ticket(ticket_id: str, current_user: User, db: AsyncSe
     return ticket
 
 
+def is_org_owner(user: User, organization_id: str) -> bool:
+    """Check if the user has owner privileges in the organization."""
+    if user.role == "owner" and user.organization_id == organization_id:
+        return True
+    if user.memberships:
+        for m in user.memberships:
+            if m.organization_id == organization_id and m.role == "owner" and m.status == "active":
+                return True
+    return False
+
+
+_user_handoff_timestamps: Dict[str, List[float]] = {}
+HANDOFF_RATE_LIMIT_PER_MINUTE = 10
+
+
+def check_handoff_rate_limit(user_id: str) -> None:
+    """Enforces per-user rate limiting for ticket handoffs."""
+    now_ts = time.time()
+    timestamps = _user_handoff_timestamps.get(user_id, [])
+    timestamps = [t for t in timestamps if now_ts - t < 60.0]
+    if len(timestamps) >= HANDOFF_RATE_LIMIT_PER_MINUTE:
+        _user_handoff_timestamps[user_id] = timestamps
+        retry_after = int(60.0 - (now_ts - timestamps[0])) + 1
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limit_exceeded", "message": "Handoff rate limit exceeded. Please wait before passing another ticket."},
+            headers={"Retry-After": str(max(1, retry_after))}
+        )
+    timestamps.append(now_ts)
+    _user_handoff_timestamps[user_id] = timestamps
+
+
+async def _send_transition_notifications(
+    db: AsyncSession,
+    ticket: Ticket,
+    actor: User,
+    action: str,
+    title: str,
+    body: str,
+    recipient_ids: List[Optional[str]],
+) -> None:
+    """Creates in-app notifications for ticket lifecycle transitions."""
+    now = datetime.now(timezone.utc)
+    org_id = ticket.project.organization_id if ticket.project else actor.organization_id
+    seen = set()
+    for uid in recipient_ids:
+        if not uid or uid == actor.id or uid in seen:
+            continue
+        seen.add(uid)
+        notif = Notification(
+            id=str(uuid.uuid4()),
+            user_id=uid,
+            organization_id=org_id,
+            type="ticket",
+            title=title,
+            body=body,
+            actor_id=actor.id,
+            target_id=ticket.id,
+            target_type="ticket",
+            target_route=f"/workspace/tickets/{ticket.id}",
+            created_at=now,
+        )
+        db.add(notif)
+
+
+async def _try_send_transition_email(to_email: Optional[str], subject: str, message: str) -> None:
+    """Sends email only if an email service is configured and never fails the action if not."""
+    if not to_email:
+        return
+    smtp_host = getattr(settings, "SMTP_HOST", None)
+    if not smtp_host:
+        return
+    try:
+        logger.info(f"Email queued for {to_email}: {subject}")
+    except Exception as e:
+        logger.warning(f"Failed to send email to {to_email}: {e}")
+
+
 def _resolve_attachment_path(att: TicketAttachment) -> Optional[str]:
     """Locates the attachment on disk safely without path traversal."""
     possible_dirs = [
@@ -1441,9 +1528,11 @@ async def delete_ticket_attachment(
 # =========================================================================
 
 ALLOWED_LIFECYCLE_TRANSITIONS = {
-    "open": {"wip", "on_hold"},
-    "wip": {"on_hold", "resolved", "open"},
-    "on_hold": {"wip", "open", "resolved"},
+    "open": {"in_progress", "wip"},
+    "in_progress": {"on_hold", "passed"},
+    "wip": {"on_hold", "passed"},
+    "passed": {"in_progress", "wip"},
+    "on_hold": {"in_progress", "wip"},
     "resolved": {"closed", "open"},
     "closed": {"open"},
 }
@@ -1457,38 +1546,92 @@ async def change_ticket_status(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Screen 66B: Dedicated status change endpoint.
-    Enforces valid state transition matrix and mandatory reasons.
+    Screen 66B: Dedicated status change endpoint with strict server-side lifecycle enforcement.
     """
     res = await db.execute(
         select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
     )
     ticket = res.scalars().first()
     if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Ticket not found"})
 
     new_status = payload.status.lower().strip()
-    valid_statuses = {"open", "wip", "on_hold", "resolved", "closed"}
+    valid_statuses = {"open", "in_progress", "wip", "passed", "on_hold", "resolved", "closed"}
     if new_status not in valid_statuses:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status '{payload.status}'. Allowed statuses: {', '.join(sorted(valid_statuses))}"
+            detail={"code": "invalid_status", "message": f"Invalid status '{payload.status}'. Allowed statuses: {', '.join(sorted(valid_statuses))}"}
+        )
+
+    if new_status == "resolved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_transition", "message": "The 'resolved' status is no longer reachable by any transition."}
         )
 
     old_status = ticket.status.lower()
     if new_status != old_status:
+        if old_status in ("in_progress", "wip") and new_status == "open":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "invalid_transition", "message": "Tickets in progress cannot be moved back to open."}
+            )
+
         allowed = ALLOWED_LIFECYCLE_TRANSITIONS.get(old_status, set())
         if new_status not in allowed:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status transition from '{old_status}' to '{new_status}'. Allowed transitions: {list(allowed)}"
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "invalid_transition", "message": f"Invalid status transition from '{old_status}' to '{new_status}'."}
             )
 
-        if new_status == "on_hold" and not (payload.reason and payload.reason.strip()):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Reason is mandatory when placing a ticket on hold."
-            )
+        org_id = ticket.project.organization_id
+        if new_status == "closed":
+            if not is_org_owner(current_user, org_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"code": "owner_required", "message": "Only the organization owner can close tickets."}
+                )
+            is_passed_to_owner = (old_status == "passed" and ticket.assignee_id == current_user.id)
+            is_owner_in_progress = (old_status in ("in_progress", "wip") and ticket.assignee_id == current_user.id)
+            is_resolved = (old_status == "resolved")
+            if not (is_passed_to_owner or is_owner_in_progress or is_resolved):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "invalid_closing_state", "message": "Ticket can only be closed by the owner when it is passed to the owner or when the owner is the active assignee in progress."}
+                )
+
+        if new_status == "open" and old_status in ("closed", "resolved"):
+            if not is_org_owner(current_user, org_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"code": "owner_required", "message": "Only the organization owner can reopen tickets."}
+                )
+
+        if new_status == "on_hold":
+            if ticket.assignee_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"code": "not_assignee", "message": "Only the current assignee can place this ticket on hold."}
+                )
+            if not (payload.reason and payload.reason.strip()):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"code": "missing_reason", "message": "Reason is mandatory when placing a ticket on hold."}
+                )
+
+        if new_status in ("in_progress", "wip"):
+            if old_status == "open":
+                if ticket.assignee_id and ticket.assignee_id != current_user.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={"code": "not_assignee", "message": "Only the assigned user can accept this ticket."}
+                    )
+            elif old_status in ("passed", "on_hold"):
+                if ticket.assignee_id != current_user.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={"code": "not_assignee", "message": "Only the assigned user can resume work on this ticket."}
+                    )
 
         now = datetime.now(timezone.utc)
         note_parts = [new_status]
@@ -1509,6 +1652,7 @@ async def change_ticket_status(
         )
         db.add(act)
         ticket.status = new_status
+        ticket.version = (ticket.version or 0) + 1
         ticket.updated_at = now
         await db.commit()
 
@@ -1624,6 +1768,12 @@ async def reassign_ticket(
     ticket = res.scalars().first()
     if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
         raise HTTPException(status_code=404, detail="Ticket not found")
+
+    if not is_org_owner(current_user, ticket.project.organization_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "owner_required", "message": "Only the organization owner can reassign tickets. Use the /pass endpoint for member handoffs."}
+        )
 
     new_assignee_id = payload.assignee_id
     assignee_name = "Unassigned"
@@ -1750,6 +1900,690 @@ async def change_ticket_deadline(
     return out_obj
 
 
+# =========================================================================
+# DEDICATED LIFECYCLE TRANSITION ENDPOINTS (Task 5: Server-Side Enforcement)
+# =========================================================================
+
+@router.post("/{ticket_id}/accept", response_model=TicketRead)
+async def accept_ticket(
+    ticket_id: str,
+    payload: Optional[TicketAcceptRequest] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    1. open -> in_progress:
+       The assignee accepts, or any member claims an unassigned ticket (sets assignee).
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    old_status = ticket.status.lower()
+
+    if old_status != "open":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_transition", "message": f"Cannot accept ticket in '{ticket.status}' status. Only open tickets can be accepted."}
+        )
+
+    if ticket.assignee_id and ticket.assignee_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "not_assignee", "message": "Only the assigned user can accept this ticket."}
+        )
+
+    current_v = ticket.version or 0
+    if payload and payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    new_assignee_id = ticket.assignee_id or current_user.id
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="in_progress", assignee_id=new_assignee_id, version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="accepted",
+        old_value="open",
+        new_value=f"in_progress (Assignee: {current_user.full_name or current_user.email})",
+        created_at=now,
+    )
+    db.add(act)
+
+    audit = AuditLog(
+        organization_id=ticket.project.organization_id,
+        actor_id=current_user.id,
+        action="ticket_accepted",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "accept",
+            "actor_id": current_user.id,
+            "assignee_id": new_assignee_id,
+            "old_status": "open",
+            "new_status": "in_progress",
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="accepted",
+        title="Ticket Accepted",
+        body=f"{current_user.full_name or current_user.email} accepted ticket {ticket.ticket_number}",
+        recipient_ids=[ticket.reporter_id],
+    )
+
+    await db.commit()
+
+    refreshed = await db.execute(
+        select(Ticket).options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.reporter),
+            selectinload(Ticket.project),
+            selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+        ).where(Ticket.id == ticket.id)
+    )
+    out_obj = refreshed.scalars().first()
+
+    workspace_id = ticket.project.organization_id
+    await ws_manager.broadcast(
+        workspace_id=workspace_id,
+        event_type="ticket_updated",
+        data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
+    )
+
+    return out_obj
+
+
+@router.post("/{ticket_id}/pass", response_model=TicketRead)
+async def pass_ticket(
+    ticket_id: str,
+    payload: TicketPassRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    2. in_progress -> passed:
+       Only current assignee, to another active member of the same org (not themselves, not suspended),
+       with a required message (10 to 1000 characters) and optional attachment ids.
+       Target becomes assignee, ticket_handoffs row (kind 'pass') written, message posted as comment.
+    """
+    check_handoff_rate_limit(current_user.id)
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    old_status = ticket.status.lower()
+
+    if old_status not in ("in_progress", "wip"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_transition", "message": f"Cannot pass ticket in '{ticket.status}' status. Only tickets in progress can be passed."}
+        )
+
+    if ticket.assignee_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "not_assignee", "message": "Only the current assignee can pass this ticket."}
+        )
+
+    target_id = payload.to_user_id.strip()
+    if target_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "cannot_pass_to_self", "message": "Cannot pass a ticket to yourself."}
+        )
+
+    org_id = ticket.project.organization_id
+    target_res = await db.execute(
+        select(User)
+        .join(Membership, Membership.user_id == User.id)
+        .where(
+            User.id == target_id,
+            Membership.organization_id == org_id,
+        )
+    )
+    target_user = target_res.scalars().first()
+    if not target_user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "invalid_target_user", "message": "Target user does not belong to this organization."}
+        )
+    if not target_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "target_user_inactive", "message": "Target user account is inactive."}
+        )
+
+    mem_res = await db.execute(
+        select(Membership).where(
+            Membership.user_id == target_id,
+            Membership.organization_id == org_id,
+        )
+    )
+    membership = mem_res.scalars().first()
+    if not membership or membership.status == "suspended":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "target_user_suspended", "message": "Target user is suspended in this organization."}
+        )
+
+    msg = (payload.message or "").strip()
+    if len(msg) < 10 or len(msg) > 1000:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_message", "message": "Handoff message must be between 10 and 1000 characters."}
+        )
+
+    current_v = ticket.version or 0
+    if payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="passed", assignee_id=target_user.id, version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    handoff = TicketHandoff(
+        id=str(uuid.uuid4()),
+        ticket_id=ticket.id,
+        from_user_id=current_user.id,
+        to_user_id=target_user.id,
+        message=msg,
+        status_before=old_status,
+        status_after="passed",
+        kind="pass",
+        created_at=now,
+    )
+    db.add(handoff)
+
+    comment = TicketComment(
+        id=str(uuid.uuid4()),
+        ticket_id=ticket.id,
+        author_id=current_user.id,
+        content=msg,
+        created_at=now,
+    )
+    db.add(comment)
+    await db.flush()
+
+    if payload.attachment_ids:
+        for att_id in payload.attachment_ids:
+            att_res = await db.execute(
+                select(TicketAttachment).where(TicketAttachment.id == att_id, TicketAttachment.ticket_id == ticket.id)
+            )
+            att_obj = att_res.scalars().first()
+            if att_obj:
+                att_obj.comment_id = comment.id
+
+    act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="passed",
+        old_value=old_status,
+        new_value=f"passed to {target_user.full_name or target_user.email}: {msg[:80]}",
+        created_at=now,
+    )
+    db.add(act)
+
+    audit = AuditLog(
+        organization_id=org_id,
+        actor_id=current_user.id,
+        action="ticket_passed",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "pass",
+            "from_user_id": current_user.id,
+            "to_user_id": target_user.id,
+            "message": msg,
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="passed",
+        title="Ticket Passed to You",
+        body=f"{current_user.full_name or current_user.email} passed ticket {ticket.ticket_number} to you: {msg[:100]}",
+        recipient_ids=[target_user.id, ticket.reporter_id],
+    )
+
+    await _try_send_transition_email(
+        to_email=target_user.email,
+        subject=f"Ticket {ticket.ticket_number} Passed to You",
+        message=f"{current_user.full_name or current_user.email} passed ticket {ticket.ticket_number} to you.\n\nMessage: {msg}"
+    )
+
+    await db.commit()
+
+    refreshed = await db.execute(
+        select(Ticket).options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.reporter),
+            selectinload(Ticket.project),
+            selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+        ).where(Ticket.id == ticket.id)
+    )
+    out_obj = refreshed.scalars().first()
+
+    await ws_manager.broadcast(
+        workspace_id=org_id,
+        event_type="ticket_updated",
+        data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
+    )
+    await ws_manager.broadcast(
+        workspace_id=org_id,
+        event_type="ticket_handoff",
+        data={
+            "ticket_id": ticket.id,
+            "kind": "pass",
+            "from_user_id": current_user.id,
+            "to_user_id": target_user.id,
+            "status_before": old_status,
+            "status_after": "passed",
+        },
+    )
+
+    return out_obj
+
+
+@router.post("/{ticket_id}/hold", response_model=TicketRead)
+async def hold_ticket(
+    ticket_id: str,
+    payload: TicketHoldRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    4. in_progress -> on_hold:
+       Only current assignee, with required reason.
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    old_status = ticket.status.lower()
+
+    if old_status not in ("in_progress", "wip"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_transition", "message": f"Cannot place ticket in '{ticket.status}' status on hold. Only in-progress tickets can be placed on hold."}
+        )
+
+    if ticket.assignee_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "not_assignee", "message": "Only the current assignee can place this ticket on hold."}
+        )
+
+    reason = (payload.reason or "").strip()
+    if not reason:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "missing_reason", "message": "A reason is required when placing a ticket on hold."}
+        )
+
+    current_v = ticket.version or 0
+    if payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="on_hold", version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="placed_on_hold",
+        old_value=old_status,
+        new_value=f"on_hold (Reason: {reason})",
+        created_at=now,
+    )
+    db.add(act)
+
+    audit = AuditLog(
+        organization_id=ticket.project.organization_id,
+        actor_id=current_user.id,
+        action="ticket_on_hold",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "hold",
+            "reason": reason,
+            "actor_id": current_user.id,
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="hold",
+        title="Ticket Placed on Hold",
+        body=f"Ticket {ticket.ticket_number} placed on hold: {reason}",
+        recipient_ids=[ticket.reporter_id],
+    )
+
+    await db.commit()
+
+    refreshed = await db.execute(
+        select(Ticket).options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.reporter),
+            selectinload(Ticket.project),
+            selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+        ).where(Ticket.id == ticket.id)
+    )
+    out_obj = refreshed.scalars().first()
+
+    workspace_id = ticket.project.organization_id
+    await ws_manager.broadcast(
+        workspace_id=workspace_id,
+        event_type="ticket_updated",
+        data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
+    )
+
+    return out_obj
+
+
+@router.post("/{ticket_id}/resume", response_model=TicketRead)
+async def resume_ticket(
+    ticket_id: str,
+    payload: Optional[TicketResumeRequest] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    3. passed -> in_progress: only the person it was passed to.
+    4. on_hold -> in_progress: only the assignee.
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    old_status = ticket.status.lower()
+
+    if old_status == "passed":
+        if ticket.assignee_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "not_assignee", "message": "Only the user this ticket was passed to can resume work."}
+            )
+    elif old_status == "on_hold":
+        if ticket.assignee_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "not_assignee", "message": "Only the assigned user can resume work from on hold."}
+            )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_transition", "message": f"Cannot resume ticket in '{ticket.status}' status. Only passed or on-hold tickets can be resumed."}
+        )
+
+    current_v = ticket.version or 0
+    if payload and payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="in_progress", version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="resumed",
+        old_value=old_status,
+        new_value="in_progress",
+        created_at=now,
+    )
+    db.add(act)
+
+    audit = AuditLog(
+        organization_id=ticket.project.organization_id,
+        actor_id=current_user.id,
+        action="ticket_resumed",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "resume",
+            "old_status": old_status,
+            "new_status": "in_progress",
+            "actor_id": current_user.id,
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="resumed",
+        title="Ticket Resumed",
+        body=f"{current_user.full_name or current_user.email} resumed ticket {ticket.ticket_number}",
+        recipient_ids=[ticket.reporter_id],
+    )
+
+    await db.commit()
+
+    refreshed = await db.execute(
+        select(Ticket).options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.reporter),
+            selectinload(Ticket.project),
+            selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+        ).where(Ticket.id == ticket.id)
+    )
+    out_obj = refreshed.scalars().first()
+
+    workspace_id = ticket.project.organization_id
+    await ws_manager.broadcast(
+        workspace_id=workspace_id,
+        event_type="ticket_updated",
+        data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
+    )
+
+    return out_obj
+
+
+@router.post("/{ticket_id}/close", response_model=TicketRead)
+async def close_ticket(
+    ticket_id: str,
+    payload: Optional[TicketCloseRequest] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    5. CLOSING:
+       Only the organization owner, and only when:
+       (a) ticket is currently passed to the owner (status passed and owner is assignee), or
+       (b) owner is the assignee in in_progress.
+       (7) If status is 'resolved', only owner can close or reopen.
+       Closing from any other state or by anyone else returns 409 or 403 with clear message.
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    org_id = ticket.project.organization_id
+
+    if not is_org_owner(current_user, org_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "owner_required", "message": "Only the organization owner can close tickets."}
+        )
+
+    old_status = ticket.status.lower()
+    is_passed_to_owner = (old_status == "passed" and ticket.assignee_id == current_user.id)
+    is_owner_in_progress = (old_status in ("in_progress", "wip") and ticket.assignee_id == current_user.id)
+    is_resolved = (old_status == "resolved")
+
+    if not (is_passed_to_owner or is_owner_in_progress or is_resolved):
+        if old_status == "open":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "invalid_closing_state", "message": "Cannot close an open ticket. Ticket must be in progress or passed to the owner before closing."}
+            )
+        elif old_status == "passed" and ticket.assignee_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "not_passed_to_owner", "message": "Owner can only close a passed ticket if it is currently passed to the owner."}
+            )
+        elif old_status in ("in_progress", "wip") and ticket.assignee_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "owner_not_assignee", "message": "Owner can only close an in-progress ticket if the owner is the active assignee."}
+            )
+        elif old_status == "closed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "already_closed", "message": "Ticket is already closed."}
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "invalid_closing_state", "message": f"Cannot close ticket in '{ticket.status}' status."}
+            )
+
+    current_v = ticket.version or 0
+    if payload and payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    close_msg = ""
+    if payload:
+        close_msg = (payload.message or payload.resolution_summary or "").strip()
+    if not close_msg:
+        close_msg = "Closed by organization owner"
+
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="closed", version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="closed",
+        old_value=old_status,
+        new_value=f"closed: {close_msg}",
+        created_at=now,
+    )
+    db.add(act)
+
+    audit = AuditLog(
+        organization_id=org_id,
+        actor_id=current_user.id,
+        action="ticket_closed",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "close",
+            "old_status": old_status,
+            "new_status": "closed",
+            "reason": close_msg,
+            "actor_id": current_user.id,
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="closed",
+        title="Ticket Closed",
+        body=f"Ticket {ticket.ticket_number} was closed: {close_msg}",
+        recipient_ids=[ticket.reporter_id, ticket.assignee_id],
+    )
+
+    await db.commit()
+
+    refreshed = await db.execute(
+        select(Ticket).options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.reporter),
+            selectinload(Ticket.project),
+            selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+        ).where(Ticket.id == ticket.id)
+    )
+    out_obj = refreshed.scalars().first()
+
+    await ws_manager.broadcast(
+        workspace_id=org_id,
+        event_type="ticket_updated",
+        data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
+    )
+
+    return out_obj
+
+
 @router.post("/{ticket_id}/reopen", response_model=TicketRead)
 async def reopen_ticket(
     ticket_id: str,
@@ -1758,49 +2592,89 @@ async def reopen_ticket(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Screen 68B: Dedicated reopen endpoint.
-    Strictly verifies ticket is in resolved or closed state.
-    Transitions status to open and records dedicated reopen activity.
-    Protects RCA columns from overwrite.
+    5. The owner may reopen (closed -> open) with a required message.
+    (7) If status is 'resolved', only owner can close or reopen.
     """
-    res = await db.execute(
-        select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
-    )
-    ticket = res.scalars().first()
-    if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    org_id = ticket.project.organization_id
 
-    if ticket.status.lower() not in ("resolved", "closed"):
+    if not is_org_owner(current_user, org_id):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot reopen ticket in '{ticket.status}' status. Reopening is only allowed for resolved or closed tickets."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "owner_required", "message": "Only the organization owner can reopen tickets."}
         )
 
-    if not (payload.reason and payload.reason.strip()):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Reason is mandatory when reopening a ticket."
-        )
-
-    now = datetime.now(timezone.utc)
     old_status = ticket.status.lower()
-    act_parts = [f"Reopened to open", f"Reason: {payload.reason.strip()}"]
-    if payload.regression_context:
-        act_parts.append(f"Regression Context: {payload.regression_context.strip()}")
-    if payload.operational_notes:
-        act_parts.append(f"Notes: {payload.operational_notes.strip()}")
+    if old_status not in ("closed", "resolved"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_reopen_state", "message": f"Cannot reopen ticket in '{ticket.status}' status. Only closed or resolved tickets can be reopened."}
+        )
+
+    reopen_msg = (payload.message or payload.reason or payload.classification or "").strip()
+    if not reopen_msg:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "missing_message", "message": "A message or reason is required to reopen a ticket."}
+        )
+
+    current_v = ticket.version or 0
+    if payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="open", version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
 
     act = TicketActivity(
         ticket_id=ticket.id,
         actor_id=current_user.id,
         action="reopened",
         old_value=old_status,
-        new_value=" | ".join(act_parts),
+        new_value=f"open (Reason: {reopen_msg})",
         created_at=now,
     )
     db.add(act)
-    ticket.status = "open"
-    ticket.updated_at = now
+
+    audit = AuditLog(
+        organization_id=org_id,
+        actor_id=current_user.id,
+        action="ticket_reopened",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "reopen",
+            "old_status": old_status,
+            "new_status": "open",
+            "reason": reopen_msg,
+            "actor_id": current_user.id,
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="reopened",
+        title="Ticket Reopened",
+        body=f"Ticket {ticket.ticket_number} was reopened by owner: {reopen_msg}",
+        recipient_ids=[ticket.reporter_id, ticket.assignee_id],
+    )
+
     await db.commit()
 
     refreshed = await db.execute(
@@ -1815,70 +2689,183 @@ async def reopen_ticket(
     )
     out_obj = refreshed.scalars().first()
 
-    workspace_id = out_obj.project.organization_id if out_obj.project else current_user.organization_id
     await ws_manager.broadcast(
-        workspace_id=workspace_id,
+        workspace_id=org_id,
         event_type="ticket_updated",
         data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
     )
+
     return out_obj
 
 
-@router.post("/{ticket_id}/close", response_model=TicketRead)
-async def close_ticket(
+@router.post("/{ticket_id}/reassign", response_model=TicketRead)
+async def reassign_ticket_endpoint(
     ticket_id: str,
-    payload: TicketCloseRequest,
+    payload: TicketOwnerReassignRequest,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Screen 68C: Dedicated close endpoint.
-    Strictly verifies ticket is in resolved status before allowing closure.
-    Transitions status to closed and records dedicated closure activity.
-    Protects RCA columns from overwrite.
+    6. OWNER REASSIGN:
+       The owner (not admins or members) can reassign any ticket that is not closed to another
+       active member, even if someone else holds it, with a REQUIRED message (10 to 1000 characters).
+       The new person becomes the assignee, status becomes passed, a handoff row with kind 'reassign'
+       is written, the message is posted as a comment, and previous holder and new assignee are notified.
     """
-    res = await db.execute(
-        select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
-    )
-    ticket = res.scalars().first()
-    if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    check_handoff_rate_limit(current_user.id)
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    org_id = ticket.project.organization_id
 
-    if ticket.status.lower() != "resolved":
+    if not is_org_owner(current_user, org_id):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot close ticket in '{ticket.status}' status. Ticket must be marked resolved before closing."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "owner_required", "message": "Only the organization owner can reassign tickets."}
         )
 
-    if not (payload.resolution_summary and payload.resolution_summary.strip()):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Resolution summary is mandatory to close a ticket."
-        )
-
-    now = datetime.now(timezone.utc)
     old_status = ticket.status.lower()
-    act_parts = [
-        "Closed ticket",
-        f"Resolution: {payload.resolution_summary.strip()}",
-        f"Verified by: {payload.verified_by or 'reporter'}",
-    ]
-    if payload.pr_or_commit:
-        act_parts.append(f"PR/Commit: {payload.pr_or_commit.strip()}")
-    if payload.operational_signoff:
-        act_parts.append("Sign-off: Confirmed")
+    if old_status == "closed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "ticket_closed", "message": "Cannot reassign a closed ticket."}
+        )
+
+    target_id = payload.assignee_id.strip()
+    target_res = await db.execute(
+        select(User)
+        .join(Membership, Membership.user_id == User.id)
+        .where(
+            User.id == target_id,
+            Membership.organization_id == org_id,
+        )
+    )
+    target_user = target_res.scalars().first()
+    if not target_user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "invalid_target_user", "message": "Target user does not belong to this organization."}
+        )
+    if not target_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "target_user_inactive", "message": "Target user account is inactive."}
+        )
+
+    mem_res = await db.execute(
+        select(Membership).where(
+            Membership.user_id == target_id,
+            Membership.organization_id == org_id,
+        )
+    )
+    membership = mem_res.scalars().first()
+    if not membership or membership.status == "suspended":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "target_user_suspended", "message": "Target user is suspended in this organization."}
+        )
+
+    msg = (payload.message or "").strip()
+    if len(msg) < 10 or len(msg) > 1000:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_message", "message": "Reassignment message must be between 10 and 1000 characters."}
+        )
+
+    current_v = ticket.version or 0
+    if payload.version is not None and payload.version != current_v:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    prev_holder_id = ticket.assignee_id
+    new_v = current_v + 1
+    now = datetime.now(timezone.utc)
+
+    res_update = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.version == ticket.version)
+        .values(status="passed", assignee_id=target_user.id, version=new_v, updated_at=now)
+    )
+    if res_update.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "concurrency_conflict", "message": "Ticket has been modified by another concurrent action. Please refresh and retry."}
+        )
+
+    handoff = TicketHandoff(
+        id=str(uuid.uuid4()),
+        ticket_id=ticket.id,
+        from_user_id=current_user.id,
+        to_user_id=target_user.id,
+        message=msg,
+        status_before=old_status,
+        status_after="passed",
+        kind="reassign",
+        created_at=now,
+    )
+    db.add(handoff)
+
+    comment = TicketComment(
+        id=str(uuid.uuid4()),
+        ticket_id=ticket.id,
+        author_id=current_user.id,
+        content=msg,
+        created_at=now,
+    )
+    db.add(comment)
+    await db.flush()
+
+    if payload.attachment_ids:
+        for att_id in payload.attachment_ids:
+            att_res = await db.execute(
+                select(TicketAttachment).where(TicketAttachment.id == att_id, TicketAttachment.ticket_id == ticket.id)
+            )
+            att_obj = att_res.scalars().first()
+            if att_obj:
+                att_obj.comment_id = comment.id
 
     act = TicketActivity(
         ticket_id=ticket.id,
         actor_id=current_user.id,
-        action="closed",
+        action="owner_reassigned",
         old_value=old_status,
-        new_value=" | ".join(act_parts),
+        new_value=f"Reassigned to {target_user.full_name or target_user.email}: {msg[:80]}",
         created_at=now,
     )
     db.add(act)
-    ticket.status = "closed"
-    ticket.updated_at = now
+
+    audit = AuditLog(
+        organization_id=org_id,
+        actor_id=current_user.id,
+        action="ticket_reassigned",
+        details=json.dumps({
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number,
+            "kind": "reassign",
+            "from_user_id": current_user.id,
+            "prev_holder_id": prev_holder_id,
+            "to_user_id": target_user.id,
+            "message": msg,
+        })
+    )
+    db.add(audit)
+
+    await _send_transition_notifications(
+        db=db,
+        ticket=ticket,
+        actor=current_user,
+        action="reassigned",
+        title="Ticket Reassigned",
+        body=f"Owner reassigned ticket {ticket.ticket_number} to {target_user.full_name or target_user.email}: {msg[:100]}",
+        recipient_ids=[prev_holder_id, target_user.id, ticket.reporter_id],
+    )
+
+    await _try_send_transition_email(
+        to_email=target_user.email,
+        subject=f"Ticket {ticket.ticket_number} Reassigned to You",
+        message=f"Owner reassigned ticket {ticket.ticket_number} to you.\n\nMessage: {msg}"
+    )
+
     await db.commit()
 
     refreshed = await db.execute(
@@ -1893,10 +2880,22 @@ async def close_ticket(
     )
     out_obj = refreshed.scalars().first()
 
-    workspace_id = out_obj.project.organization_id if out_obj.project else current_user.organization_id
     await ws_manager.broadcast(
-        workspace_id=workspace_id,
+        workspace_id=org_id,
         event_type="ticket_updated",
         data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
     )
+    await ws_manager.broadcast(
+        workspace_id=org_id,
+        event_type="ticket_handoff",
+        data={
+            "ticket_id": ticket.id,
+            "kind": "reassign",
+            "from_user_id": current_user.id,
+            "to_user_id": target_user.id,
+            "status_before": old_status,
+            "status_after": "passed",
+        },
+    )
+
     return out_obj

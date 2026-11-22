@@ -629,16 +629,48 @@ class TicketDeadlineChangeRequest(BaseSchema):
     operational_remarks: Optional[str] = None
 
 
+class TicketAcceptRequest(BaseSchema):
+    version: Optional[int] = None
+
+
+class TicketPassRequest(BaseSchema):
+    to_user_id: str
+    message: str = Field(..., min_length=10, max_length=1000)
+    attachment_ids: Optional[List[str]] = None
+    version: Optional[int] = None
+
+
+class TicketHoldRequest(BaseSchema):
+    reason: str = Field(..., min_length=1, max_length=500)
+    version: Optional[int] = None
+
+
+class TicketResumeRequest(BaseSchema):
+    version: Optional[int] = None
+
+
+class TicketOwnerReassignRequest(BaseSchema):
+    assignee_id: str
+    message: str = Field(..., min_length=10, max_length=1000)
+    attachment_ids: Optional[List[str]] = None
+    version: Optional[int] = None
+
+
 class TicketReopenRequest(BaseSchema):
-    classification: str
+    message: Optional[str] = None
+    reason: Optional[str] = None
+    classification: Optional[str] = None
     telemetry_notes: Optional[str] = None
+    version: Optional[int] = None
 
 
 class TicketCloseRequest(BaseSchema):
-    resolution_summary: str
+    message: Optional[str] = None
+    resolution_summary: Optional[str] = None
     commit_sha: Optional[str] = None
     pr_reference: Optional[str] = None
     verified_in_staging: bool = False
+    version: Optional[int] = None
 
 
 

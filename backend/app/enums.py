@@ -85,7 +85,9 @@ TASK_PRIORITY_DISPLAY = {
 
 class TicketStatus(str, Enum):
     open = "open"
+    in_progress = "in_progress"
     wip = "wip"
+    passed = "passed"
     on_hold = "on_hold"
     resolved = "resolved"
     closed = "closed"
@@ -100,7 +102,9 @@ class TicketSeverity(str, Enum):
 
 TICKET_STATUS_DISPLAY = {
     TicketStatus.open: "Open",
+    TicketStatus.in_progress: "In Progress",
     TicketStatus.wip: "Work in Progress",
+    TicketStatus.passed: "Passed",
     TicketStatus.on_hold: "On Hold",
     TicketStatus.resolved: "Resolved",
     TicketStatus.closed: "Closed",
