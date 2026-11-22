@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, Index, text, UniqueConstraint
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, Index, text, UniqueConstraint, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 from backend.app.database import Base
 
@@ -182,12 +182,14 @@ class Ticket(Base):
     rca_mitigation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     rca_action_items: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0, server_default=text("0"))
+    task_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     project: Mapped["Project"] = relationship(back_populates="tickets")
     assignee: Mapped[Optional["User"]] = relationship("User", foreign_keys=[assignee_id], lazy="selectin")
     reporter: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reporter_id], lazy="selectin")
+    task: Mapped[Optional["Task"]] = relationship("Task", foreign_keys=[task_id], back_populates="tickets", lazy="selectin")
     comments: Mapped[list["TicketComment"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
     attachments: Mapped[list["TicketAttachment"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
     activities: Mapped[list["TicketActivity"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
@@ -232,7 +234,7 @@ class TicketAttachment(Base):
     __tablename__ = "ticket_attachments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    ticket_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("tickets.id", ondelete="CASCADE"), nullable=True)
+    ticket_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("tickets.id"), nullable=True)
     comment_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("ticket_comments.id", ondelete="SET NULL"), nullable=True)
     discussion_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("discussions.id", ondelete="CASCADE"), nullable=True)
     discussion_comment_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("discussion_comments.id", ondelete="SET NULL"), nullable=True)
@@ -411,6 +413,31 @@ class Task(Base):
     reporter: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reporter_id])
     comments: Mapped[list["TaskComment"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     attachments: Mapped[list["TaskAttachment"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    activities: Mapped[list["TaskActivity"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    tickets: Mapped[list["Ticket"]] = relationship(back_populates="task")
+
+
+class TaskActivity(Base):
+    __tablename__ = "task_activities"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    actor_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    field_name: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    old_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    new_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("ix_task_activities_task_id_created_at", "task_id", "created_at"),
+        Index("ix_task_activities_organization_id_created_at", "organization_id", "created_at"),
+    )
+
+    task: Mapped["Task"] = relationship(back_populates="activities")
+    actor: Mapped[Optional["User"]] = relationship("User", foreign_keys=[actor_id])
 
 
 class TaskComment(Base):
