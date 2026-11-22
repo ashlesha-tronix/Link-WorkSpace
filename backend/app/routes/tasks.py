@@ -16,10 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database import get_db
 from backend.app.dependencies import get_current_active_user
-from backend.app.models import Task, Project, User, ProjectActivity, TaskComment, TaskAttachment, TaskActivity, Ticket, AuditLog
+from backend.app.models import (
+    Task, Project, User, ProjectActivity, TaskComment, TaskAttachment,
+    TaskActivity, Ticket, TicketActivity, TicketComment, TicketAttachment,
+    TicketHandoff, AuditLog
+)
 from backend.app.enums import TaskStatus, TaskPriority, TaskType
 from backend.app.core.websockets import ws_manager, authenticate_ws
 from backend.app.services.metrics import get_my_tasks_stats
+from backend.app.schemas import TicketRead
 from backend.app.routes.tasks_schemas import (
     TaskCreate,
     TaskUpdate,
@@ -36,6 +41,7 @@ from backend.app.routes.tasks_schemas import (
     LinkTicketRequest,
     ActorSchema,
     TaskPermissions,
+    TaskTicketListResponse,
 )
 
 router = APIRouter()
@@ -179,6 +185,12 @@ def _format_task_activity_read(act: TaskActivity, actor: Optional[User]) -> Task
 def _format_task_read(t: Task, current_user: Optional[User] = None) -> TaskRead:
     assignee_actor = _build_actor_schema(getattr(t, "assignee", None), getattr(t, "assignee_id", None))
     reporter_actor = _build_actor_schema(getattr(t, "reporter", None), getattr(t, "reporter_id", None))
+    tickets_list = getattr(t, "tickets", None) or []
+    t_count = len(tickets_list)
+    open_t_count = sum(
+        1 for tk in tickets_list
+        if (getattr(tk, "status", None) or "").lower() not in ("closed", "resolved")
+    )
     return TaskRead(
         id=t.id,
         task_number=t.task_number,
@@ -199,6 +211,9 @@ def _format_task_read(t: Task, current_user: Optional[User] = None) -> TaskRead:
         updated_at=t.updated_at,
         comment_count=len(t.comments) if t.comments else 0,
         attachment_count=len(t.attachments) if t.attachments else 0,
+        tickets_count=t_count,
+        open_tickets_count=open_t_count,
+        ticket_count=t_count,
         assignee=assignee_actor,
         reporter=reporter_actor,
         assigner=reporter_actor,
@@ -281,6 +296,7 @@ async def list_tasks(
             selectinload(Task.reporter),
             selectinload(Task.comments),
             selectinload(Task.attachments),
+            selectinload(Task.tickets),
         )
         .where(*base_filter)
         .order_by(desc(Task.created_at))
@@ -349,6 +365,7 @@ async def get_task(
             selectinload(Task.reporter),
             selectinload(Task.comments),
             selectinload(Task.attachments),
+            selectinload(Task.tickets),
         )
         .where(Task.id == task_id, Task.organization_id == current_user.organization_id)
     )
@@ -499,6 +516,7 @@ async def create_task(
             selectinload(Task.reporter),
             selectinload(Task.comments),
             selectinload(Task.attachments),
+            selectinload(Task.tickets),
         )
         .where(Task.id == task_id)
     )
@@ -557,6 +575,7 @@ async def update_task(
             selectinload(Task.reporter),
             selectinload(Task.comments),
             selectinload(Task.attachments),
+            selectinload(Task.tickets),
         )
         .where(Task.id == task_id, Task.organization_id == current_user.organization_id)
     )
@@ -764,6 +783,7 @@ async def update_task(
             selectinload(Task.reporter),
             selectinload(Task.comments),
             selectinload(Task.attachments),
+            selectinload(Task.tickets),
         )
         .where(Task.id == task_id)
     )
@@ -865,6 +885,22 @@ async def delete_task(
                 "message": "Only the task creator, organization owner, or administrators can delete tasks."
             }
         )
+
+    # Deleting a task keeps its tickets (task_id becomes null) and logs it
+    now_utc = datetime.now(timezone.utc)
+    t_ticks = await db.execute(select(Ticket).where(Ticket.task_id == t.id))
+    linked_tickets = t_ticks.scalars().all()
+    for tk in linked_tickets:
+        tk.task_id = None
+        act = TicketActivity(
+            ticket_id=tk.id,
+            actor_id=current_user.id,
+            action="task_unlinked",
+            old_value=t.task_number,
+            new_value=None,
+            created_at=now_utc,
+        )
+        db.add(act)
 
     if t.project_id:
         activity = ProjectActivity(
@@ -1343,6 +1379,17 @@ async def link_ticket(
         created_at=now,
     )
     db.add(act)
+
+    # Record TicketActivity on the linked ticket
+    t_act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="task_linked",
+        old_value=None,
+        new_value=task.task_number,
+        created_at=now,
+    )
+    db.add(t_act)
     await db.commit()
 
     act_read = _format_task_activity_read(act, current_user)
@@ -1351,6 +1398,64 @@ async def link_ticket(
         {"event": "task_activity", "activity": act_read.model_dump(mode="json")}
     )
     return {"status": "linked", "task_id": task.id, "ticket_id": ticket.id, "ticket_number": ticket.ticket_number}
+
+
+@router.get("/{task_id}/tickets", response_model=TaskTicketListResponse, summary="Get tickets linked to task")
+async def get_task_tickets(
+    task_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=50),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get paginated tickets linked to this task, organization scoped.
+    """
+    t_res = await db.execute(
+        select(Task).where(Task.id == task_id, Task.organization_id == current_user.organization_id)
+    )
+    task = t_res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    count_res = await db.execute(
+        select(func.count(Ticket.id))
+        .join(Ticket.project)
+        .where(
+            Ticket.task_id == task_id,
+            Project.organization_id == current_user.organization_id,
+        )
+    )
+    total = count_res.scalar() or 0
+
+    stmt = (
+        select(Ticket)
+        .options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.reporter),
+            selectinload(Ticket.project),
+            selectinload(Ticket.task).selectinload(Task.assignee),
+            selectinload(Ticket.comments).selectinload(TicketComment.author),
+            selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
+            selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
+        )
+        .join(Ticket.project)
+        .where(
+            Ticket.task_id == task_id,
+            Project.organization_id == current_user.organization_id,
+        )
+        .order_by(desc(Ticket.created_at))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    res = await db.execute(stmt)
+    tickets = res.scalars().all()
+
+    items = [TicketRead.model_validate(tk) for tk in tickets]
+    return TaskTicketListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 @router.delete("/{task_id}/tickets/{ticket_id}", summary="Unlink ticket from task")
@@ -1392,6 +1497,16 @@ async def unlink_ticket(
         created_at=now,
     )
     db.add(act)
+
+    t_act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="task_unlinked",
+        old_value=task.task_number,
+        new_value=None,
+        created_at=now,
+    )
+    db.add(t_act)
     await db.commit()
 
     act_read = _format_task_activity_read(act, current_user)

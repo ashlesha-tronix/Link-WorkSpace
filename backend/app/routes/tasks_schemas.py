@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional, Dict
 from pydantic import BaseModel, ConfigDict, model_validator
+from backend.app.schemas import TicketRead
 
 
 class BaseSchema(BaseModel):
@@ -212,6 +213,9 @@ class TaskRead(BaseSchema):
     updated_at: Optional[datetime] = None
     comment_count: int = 0
     attachment_count: int = 0
+    tickets_count: int = 0
+    open_tickets_count: int = 0
+    ticket_count: Optional[int] = None
     assignee: Optional[ActorSchema] = None
     reporter: Optional[ActorSchema] = None
     assigner: Optional[ActorSchema] = None
@@ -231,9 +235,18 @@ class TaskRead(BaseSchema):
             self.assigner = self.reporter
         elif not self.reporter and self.assigner:
             self.reporter = self.assigner
+        if self.ticket_count is None:
+            self.ticket_count = self.tickets_count
         if self.status:
             self.status = self.status.lower().replace("to_do", "todo")
         return self
+
+
+class TaskTicketListResponse(BaseSchema):
+    items: List[TicketRead]
+    total: int
+    page: int
+    page_size: int
 
 
 class TaskListResponse(BaseSchema):

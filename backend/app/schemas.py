@@ -556,6 +556,34 @@ class TaskRead(TaskBase):
     assigner: Optional[UserRead] = None
 
 
+class TaskSummary(BaseSchema):
+    id: str
+    key: str
+    title: str
+    status: str
+    assignee_name: Optional[str] = None
+    due_date: Optional[datetime] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def from_task_orm(cls, data):
+        if hasattr(data, "__dict__") or not isinstance(data, dict):
+            key = getattr(data, "task_number", None) or getattr(data, "key", "")
+            assignee = data.__dict__.get("assignee") if hasattr(data, "__dict__") else getattr(data, "assignee", None)
+            assignee_name = None
+            if assignee:
+                assignee_name = (getattr(assignee, "display_name", None) or getattr(assignee, "full_name", None) or "").strip() or None
+            return {
+                "id": getattr(data, "id", ""),
+                "key": key,
+                "title": getattr(data, "title", ""),
+                "status": getattr(data, "status", ""),
+                "assignee_name": assignee_name,
+                "due_date": getattr(data, "due_date", None),
+            }
+        return data
+
+
 class TicketBase(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -569,6 +597,7 @@ class TicketBase(BaseSchema):
     rca_mitigation: Optional[str] = None
     rca_action_items: Optional[str] = None
     version: Optional[int] = 0
+    task_id: Optional[str] = None
 
 
 class TicketCreate(BaseSchema):
@@ -576,7 +605,8 @@ class TicketCreate(BaseSchema):
     description: Optional[str] = None
     severity: Optional[str] = "major"
     status: Optional[str] = "open"
-    project_id: str
+    project_id: Optional[str] = None
+    task_id: Optional[str] = None
     assignee_id: Optional[str] = None
     reporter_id: Optional[str] = None
     deadline: Optional[datetime] = None
@@ -593,6 +623,7 @@ class TicketUpdate(BaseSchema):
     title: Optional[str] = None
     description: Optional[str] = None
     project_id: Optional[str] = None
+    task_id: Optional[str] = None
     severity: Optional[str] = None
     status: Optional[str] = None
     assignee_id: Optional[str] = None
@@ -755,6 +786,8 @@ class TicketRead(TicketBase):
     id: str
     ticket_number: str
     project_id: str
+    task_id: Optional[str] = None
+    task: Optional[TaskSummary] = None
     version: Optional[int] = 0
     assignee_id: Optional[str] = None
     reporter_id: Optional[str] = None

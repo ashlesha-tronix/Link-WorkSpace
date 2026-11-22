@@ -38,6 +38,8 @@ from backend.app.models import (
     TicketHandoff,
     AuditLog,
     Notification,
+    Task,
+    TaskActivity,
 )
 from backend.app.enums import TicketStatus
 from fastapi.responses import FileResponse
@@ -268,6 +270,7 @@ async def get_filtered_tickets_query(
     db: AsyncSession,
     organization_id: str,
     project_id: Optional[str] = None,
+    task_id: Optional[str] = None,
     severity: Optional[str] = None,
     status: Optional[str] = None,
     assignee_id: Optional[str] = None,
@@ -286,6 +289,7 @@ async def get_filtered_tickets_query(
             selectinload(Ticket.assignee),
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
+            selectinload(Ticket.task).selectinload(Task.assignee),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
             selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
@@ -299,6 +303,9 @@ async def get_filtered_tickets_query(
 
     if project_id and project_id.lower() != "all":
         query = query.where(Ticket.project_id == project_id)
+
+    if task_id and task_id.lower() != "all":
+        query = query.where(Ticket.task_id == task_id)
 
     norm_sev = normalize_ticket_severity(severity)
     if norm_sev:
@@ -429,6 +436,7 @@ async def get_ticket_priority(
 @router.get("/", response_model=List[TicketRead])
 async def list_tickets(
     project_id: Optional[str] = Query(None, description="Filter by project ID"),
+    task_id: Optional[str] = Query(None, description="Filter by task ID"),
     severity: Optional[str] = Query(None, description="Filter by severity (blocker, critical, major, minor)"),
     status: Optional[str] = Query(None, description="Filter by status (open, wip, on_hold, resolved, closed)"),
     assignee_id: Optional[str] = Query(None, description="Filter by assignee ID"),
@@ -443,6 +451,7 @@ async def list_tickets(
         db=db,
         organization_id=current_user.organization_id,
         project_id=project_id,
+        task_id=task_id,
         severity=severity,
         status=status,
         assignee_id=assignee_id,
@@ -466,9 +475,37 @@ async def create_ticket(
     - Uses controlled retry loop with transaction savepoint on unique constraint conflicts.
     - Computes next sequence without hardcoded offsets.
     """
+    target_project_id = ticket_in.project_id
+    task = None
+
+    if ticket_in.task_id:
+        t_res = await db.execute(
+            select(Task)
+            .options(selectinload(Task.assignee))
+            .where(Task.id == ticket_in.task_id)
+        )
+        task = t_res.scalars().first()
+        if not task:
+            raise HTTPException(status_code=422, detail="Task not found")
+        if task.organization_id != current_user.organization_id:
+            raise HTTPException(status_code=422, detail="Task belongs to another organization")
+        
+        if ticket_in.project_id:
+            if task.project_id and task.project_id != ticket_in.project_id:
+                raise HTTPException(status_code=422, detail="Task belongs to a different project than the ticket")
+            target_project_id = ticket_in.project_id
+        else:
+            # Set the ticket's project from the task if none is given
+            target_project_id = task.project_id
+            if not target_project_id:
+                raise HTTPException(status_code=422, detail="Task is not associated with a project; project_id is required")
+    else:
+        if not target_project_id:
+            raise HTTPException(status_code=422, detail="project_id is required")
+
     p_res = await db.execute(
         select(Project).where(
-            Project.id == ticket_in.project_id,
+            Project.id == target_project_id,
             Project.organization_id == current_user.organization_id
         )
     )
@@ -531,7 +568,8 @@ async def create_ticket(
                     description=ticket_in.description,
                     severity=(ticket_in.severity or "major").lower(),
                     status=(ticket_in.status or "open").lower(),
-                    project_id=ticket_in.project_id,
+                    project_id=target_project_id,
+                    task_id=task.id if task else None,
                     assignee_id=ticket_in.assignee_id,
                     reporter_id=ticket_in.reporter_id or current_user.id,
                     deadline=ticket_in.deadline,
@@ -579,6 +617,31 @@ async def create_ticket(
         created_at=now,
     )
     db.add(activity)
+
+    if task:
+        t_act_ticket = TicketActivity(
+            ticket_id=new_ticket.id,
+            actor_id=current_user.id,
+            action="task_linked",
+            old_value=None,
+            new_value=task.task_number,
+            created_at=now,
+        )
+        db.add(t_act_ticket)
+
+        t_act_task = TaskActivity(
+            task_id=task.id,
+            organization_id=current_user.organization_id,
+            actor_id=current_user.id,
+            action="ticket_linked",
+            field_name="task_id",
+            old_value=None,
+            new_value=new_ticket.ticket_number,
+            meta={"ticket_id": new_ticket.id, "ticket_number": new_ticket.ticket_number, "ticket_title": new_ticket.title},
+            created_at=now,
+        )
+        db.add(t_act_task)
+
     await db.commit()
 
     # Re-fetch full details
@@ -587,6 +650,7 @@ async def create_ticket(
             selectinload(Ticket.assignee),
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
+            selectinload(Ticket.task).selectinload(Task.assignee),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
             selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
@@ -630,6 +694,7 @@ async def get_ticket_details(
             selectinload(Ticket.assignee),
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
+            selectinload(Ticket.task).selectinload(Task.assignee),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
             selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
@@ -739,6 +804,100 @@ async def update_ticket(
     if "rca_action_items" in update_data:
         ticket.rca_action_items = update_data["rca_action_items"]
 
+    if "task_id" in update_data:
+        new_task_id = update_data["task_id"]
+        old_task_id = ticket.task_id
+        if new_task_id is None or new_task_id == "":
+            if old_task_id:
+                old_task_res = await db.execute(select(Task).where(Task.id == old_task_id))
+                old_task = old_task_res.scalars().first()
+                old_tnum = old_task.task_number if old_task else old_task_id
+
+                ticket.task_id = None
+                ticket.task = None
+                act = TicketActivity(
+                    ticket_id=ticket.id,
+                    actor_id=current_user.id,
+                    action="task_unlinked",
+                    old_value=old_tnum,
+                    new_value=None,
+                    created_at=now,
+                )
+                db.add(act)
+
+                if old_task:
+                    t_act = TaskActivity(
+                        task_id=old_task.id,
+                        organization_id=current_user.organization_id,
+                        actor_id=current_user.id,
+                        action="ticket_unlinked",
+                        field_name="task_id",
+                        old_value=ticket.ticket_number,
+                        new_value=None,
+                        meta={"ticket_id": ticket.id, "ticket_number": ticket.ticket_number, "ticket_title": ticket.title},
+                        created_at=now,
+                    )
+                    db.add(t_act)
+        elif new_task_id != old_task_id:
+            t_res = await db.execute(
+                select(Task)
+                .options(selectinload(Task.assignee))
+                .where(Task.id == new_task_id)
+            )
+            target_task = t_res.scalars().first()
+            if not target_task:
+                raise HTTPException(status_code=422, detail="Task not found")
+            if target_task.organization_id != current_user.organization_id:
+                raise HTTPException(status_code=422, detail="Task belongs to another organization")
+            
+            effective_project_id = update_data.get("project_id") or ticket.project_id
+            if target_task.project_id and target_task.project_id != effective_project_id:
+                raise HTTPException(status_code=422, detail="Task belongs to a different project than the ticket")
+
+            old_tnum = None
+            if old_task_id:
+                old_task_res = await db.execute(select(Task).where(Task.id == old_task_id))
+                old_task = old_task_res.scalars().first()
+                if old_task:
+                    old_tnum = old_task.task_number
+                    t_act_old = TaskActivity(
+                        task_id=old_task.id,
+                        organization_id=current_user.organization_id,
+                        actor_id=current_user.id,
+                        action="ticket_unlinked",
+                        field_name="task_id",
+                        old_value=ticket.ticket_number,
+                        new_value=None,
+                        meta={"ticket_id": ticket.id, "ticket_number": ticket.ticket_number, "ticket_title": ticket.title},
+                        created_at=now,
+                    )
+                    db.add(t_act_old)
+
+            ticket.task_id = target_task.id
+            ticket.task = target_task
+            act = TicketActivity(
+                ticket_id=ticket.id,
+                actor_id=current_user.id,
+                action="task_linked",
+                old_value=old_tnum,
+                new_value=target_task.task_number,
+                created_at=now,
+            )
+            db.add(act)
+
+            t_act = TaskActivity(
+                task_id=target_task.id,
+                organization_id=current_user.organization_id,
+                actor_id=current_user.id,
+                action="ticket_linked",
+                field_name="task_id",
+                old_value=None,
+                new_value=ticket.ticket_number,
+                meta={"ticket_id": ticket.id, "ticket_number": ticket.ticket_number, "ticket_title": ticket.title},
+                created_at=now,
+            )
+            db.add(t_act)
+
     ticket.updated_at = now
     await db.commit()
 
@@ -748,6 +907,7 @@ async def update_ticket(
             selectinload(Ticket.assignee),
             selectinload(Ticket.reporter),
             selectinload(Ticket.project),
+            selectinload(Ticket.task).selectinload(Task.assignee),
             selectinload(Ticket.comments).selectinload(TicketComment.author),
             selectinload(Ticket.comments).selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
@@ -783,6 +943,25 @@ async def delete_ticket(
         raise HTTPException(status_code=404, detail="Ticket not found")
 
     workspace_id = ticket.project.organization_id if ticket.project else current_user.organization_id
+
+    # If ticket was linked to a task, record ticket_unlinked on the task
+    if ticket.task_id:
+        t_res = await db.execute(select(Task).where(Task.id == ticket.task_id))
+        task = t_res.scalars().first()
+        if task:
+            t_act = TaskActivity(
+                task_id=task.id,
+                organization_id=current_user.organization_id,
+                actor_id=current_user.id,
+                action="ticket_unlinked",
+                field_name="task_id",
+                old_value=ticket.ticket_number,
+                new_value=None,
+                meta={"ticket_id": ticket.id, "ticket_number": ticket.ticket_number, "ticket_title": ticket.title},
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(t_act)
+
     await db.delete(ticket)
     await db.commit()
 
