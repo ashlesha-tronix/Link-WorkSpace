@@ -3,6 +3,9 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import { ticketsService, createTicketsWebSocket } from '../../../services/ticketsService';
 import { authService } from '../../../services/api';
 import { STATUS_CONFIG, SEVERITY_CONFIG, TICKET_STATUSES, TICKET_SEVERITIES } from '../constants/ticketConstants';
+import { TicketCommentBox } from '../components/TicketCommentBox';
+import { TicketCommentFeed } from '../components/TicketCommentFeed';
+import { TicketAttachmentsCard } from '../components/TicketAttachmentsCard';
 
 export const TicketDetailsPage = () => {
   const { id } = useParams();
@@ -12,19 +15,11 @@ export const TicketDetailsPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Comments state
-  const [newComment, setNewComment] = useState('');
-  const [submittingComment, setSubmittingComment] = useState(false);
-
   // Status & Severity menu toggles
   const [isStatusMenuOpen, setIsStatusMenuOpen] = useState(false);
   const [isSeverityMenuOpen, setIsSeverityMenuOpen] = useState(false);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleInput, setTitleInput] = useState('');
-
-  // Upload attachment trigger
-  const [uploadingAttachment, setUploadingAttachment] = useState(false);
-  const [attachmentError, setAttachmentError] = useState(null);
 
   // Fetch Ticket Data
   const fetchTicket = useCallback(async () => {
@@ -55,9 +50,10 @@ export const TicketDetailsPage = () => {
       const orgId = user?.organization_id || localStorage.getItem('organization_id') || localStorage.getItem('active_workspace_id') || '';
       cleanup = wsFn(orgId, (event) => {
         const eventType = event?.type || event?.event;
+        const eventTicketId = event?.ticket_id || event?.ticket?.id || event?.data?.ticket_id;
         if (
-          ((eventType === 'ticket_updated' || eventType === 'ticket_status_changed') && (event.ticket?.id === id || event.ticket_id === id)) ||
-          (eventType === 'ticket_comment_added' && (event.ticket_id === id || event.ticket?.id === id))
+          ((eventType === 'ticket_updated' || eventType === 'ticket_status_changed' || eventType === 'ticket_attachment_changed' || eventType === 'attachment_added' || eventType === 'attachment_deleted') && (eventTicketId === id)) ||
+          ((eventType === 'ticket_comment_added' || eventType === 'comment_added') && (eventTicketId === id))
         ) {
           fetchTicket();
         }
@@ -112,45 +108,6 @@ export const TicketDetailsPage = () => {
       console.error('Failed to update title:', err);
       fetchTicket();
     }
-  };
-
-  // Add Comment
-  const handleAddComment = async (e) => {
-    e.preventDefault();
-    if (!newComment.trim() || submittingComment) return;
-    try {
-      setSubmittingComment(true);
-      await ticketsService.addComment(id, { content: newComment.trim() });
-      setNewComment('');
-      fetchTicket();
-    } catch (err) {
-      console.error('Failed to add comment:', err);
-    } finally {
-      setSubmittingComment(false);
-    }
-  };
-
-  // Upload Attachment
-  const handleUploadClick = async () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.txt,.json,.csv,.log,.pcap,.zip,.md';
-    input.onchange = async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      try {
-        setUploadingAttachment(true);
-        setAttachmentError(null);
-        await ticketsService.addAttachment(id, file);
-        fetchTicket();
-      } catch (err) {
-        console.error('Failed to attach file:', err);
-        setAttachmentError(err.response?.data?.detail || 'Failed to upload attachment.');
-      } finally {
-        setUploadingAttachment(false);
-      }
-    };
-    input.click();
   };
 
   // Check SLA Status
@@ -593,61 +550,17 @@ export const TicketDetailsPage = () => {
               </div>
 
               {/* Feed items */}
-              <div className="space-y-space-md">
-                {(!ticket.comments || ticket.comments.length === 0) ? (
-                  <p className="text-center py-6 text-text-muted font-body-sm">
-                    No comments yet. Post the first operational update below.
-                  </p>
-                ) : (
-                  ticket.comments.map((comment) => (
-                    <div key={comment.id} className="flex gap-space-md">
-                      <div className="w-10 h-10 rounded-full bg-secondary-container text-on-secondary-container flex items-center justify-center font-label-md text-label-md font-semibold shrink-0 shadow-sm">
-                        {comment.author?.full_name ? comment.author.full_name.slice(0, 2).toUpperCase() : 'U'}
-                      </div>
-                      <div className="flex-1 space-y-1.5">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="font-label-md text-label-md text-text-primary font-bold">
-                              {comment.author?.full_name || 'Team Member'}
-                            </span>
-                            <span className="text-text-muted text-xs">
-                              • {new Date(comment.created_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="p-space-md bg-canvas-lavender/40 rounded-xl space-y-1 font-body-md text-body-md text-text-secondary">
-                          <p>{comment.content}</p>
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
+              <TicketCommentFeed
+                comments={ticket.comments}
+                ticketId={id}
+                onAttachmentDeleted={fetchTicket}
+              />
 
               {/* Comment Composer */}
-              <form onSubmit={handleAddComment} className="p-space-md bg-canvas-lavender/60 rounded-xl space-y-space-sm">
-                <span className="font-label-md text-label-md text-text-primary">Post Reply or Operational Update</span>
-                <div className="bg-surface-card rounded-lg shadow-sm overflow-hidden">
-                  <textarea
-                    rows={3}
-                    value={newComment}
-                    onChange={(e) => setNewComment(e.target.value)}
-                    placeholder="Type your comment, update steps, or notes..."
-                    className="w-full p-3 font-body-md text-body-md text-text-primary placeholder:text-text-muted outline-none resize-y"
-                  ></textarea>
-                  <div className="px-3 py-2 bg-canvas-lavender/30 flex items-center justify-between border-t border-border-subtle">
-                    <span className="text-xs text-text-muted">Press Post Comment to submit</span>
-                    <button
-                      type="submit"
-                      disabled={!newComment.trim() || submittingComment}
-                      className="px-4 py-1.5 rounded-lg bg-btn-primary hover:bg-primary-hover active:bg-primary disabled:opacity-50 text-on-primary font-label-sm text-label-sm font-semibold shadow-sm transition-colors flex items-center gap-1.5"
-                    >
-                      <span>{submittingComment ? 'Posting...' : 'Post Comment'}</span>
-                      <span className="material-symbols-outlined text-sm">send</span>
-                    </button>
-                  </div>
-                </div>
-              </form>
+              <TicketCommentBox
+                ticketId={id}
+                onCommentAdded={fetchTicket}
+              />
             </div>
           </div>
 
@@ -731,70 +644,11 @@ export const TicketDetailsPage = () => {
             </div>
 
             {/* Attachments & Artifacts */}
-            <div className="bg-surface-card rounded-xl p-space-lg shadow-sm space-y-space-md">
-              <div className="flex items-center justify-between border-b border-border-subtle pb-space-sm">
-                <div className="flex items-center gap-2">
-                  <span className="material-symbols-outlined text-primary text-xl">folder_zip</span>
-                  <h2 className="font-headline-sm text-headline-sm text-text-primary">Attachments &amp; Artifacts</h2>
-                </div>
-                <span className="font-label-sm text-label-sm text-text-muted">
-                  {ticket.attachments?.length || 0} files
-                </span>
-              </div>
-
-              <div className="space-y-space-sm">
-                {(!ticket.attachments || ticket.attachments.length === 0) ? (
-                  <p className="text-xs text-text-muted py-2 text-center">No diagnostic files attached.</p>
-                ) : (
-                  ticket.attachments.map((file) => (
-                    <div
-                      key={file.id}
-                      className="p-space-sm rounded-xl bg-canvas-lavender/50 hover:bg-canvas-lavender flex items-center justify-between transition-colors group"
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-10 h-10 rounded-lg bg-surface-card text-primary flex items-center justify-center shadow-sm shrink-0">
-                          <span className="material-symbols-outlined text-xl">file_present</span>
-                        </div>
-                        <div className="truncate">
-                          <p className="font-label-md text-label-md text-text-primary truncate">{file.name}</p>
-                          <p className="font-body-sm text-body-sm text-text-secondary">
-                            {file.size_bytes ? `${Math.round(file.size_bytes / 1024)} KB` : 'Attached file'}
-                          </p>
-                        </div>
-                      </div>
-                      <a
-                        href={file.file_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="p-2 text-text-muted hover:text-text-primary transition-colors"
-                        title="Open file"
-                      >
-                        <span className="material-symbols-outlined text-lg">download</span>
-                      </a>
-                    </div>
-                  ))
-                )}
-              </div>
-
-              {attachmentError && (
-                <div className="p-2.5 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg flex items-center justify-between">
-                  <span>{attachmentError}</span>
-                  <button type="button" onClick={() => setAttachmentError(null)} className="text-red-500 hover:text-red-700">
-                    <span className="material-symbols-outlined text-sm">close</span>
-                  </button>
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={handleUploadClick}
-                disabled={uploadingAttachment}
-                className="w-full py-2 rounded-lg bg-surface-card hover:bg-canvas-lavender text-primary font-label-md text-label-md transition-colors flex items-center justify-center gap-1.5 shadow-sm border border-border-subtle"
-              >
-                <span className="material-symbols-outlined text-base">cloud_upload</span>
-                <span>{uploadingAttachment ? 'Uploading...' : 'Upload Diagnostic File'}</span>
-              </button>
-            </div>
+            <TicketAttachmentsCard
+              ticketId={id}
+              initialAttachments={ticket.attachments || []}
+              onAttachmentChange={fetchTicket}
+            />
 
             {/* Audit Log & Event Trail */}
             <div className="bg-surface-card rounded-xl p-space-lg shadow-sm space-y-space-md">

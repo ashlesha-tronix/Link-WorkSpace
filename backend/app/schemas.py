@@ -643,18 +643,30 @@ class TicketCloseRequest(BaseSchema):
 
 
 class TicketCommentCreate(BaseSchema):
-    content: str
+    content: Optional[str] = None
     is_internal: bool = False
+    attachment_ids: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def validate_content_or_attachments(self) -> "TicketCommentCreate":
+        has_text = bool(self.content and self.content.strip())
+        has_attachments = bool(self.attachment_ids and len(self.attachment_ids) > 0)
+        if not has_text and not has_attachments:
+            raise ValueError("Comment must include text content or at least one attachment.")
+        if self.attachment_ids and len(self.attachment_ids) > 5:
+            raise ValueError("A comment can have at most 5 attachments.")
+        return self
 
 
 class TicketCommentRead(BaseSchema):
     id: str
     ticket_id: str
     author_id: str
-    content: str
+    content: Optional[str] = None
     is_internal: bool = False
     created_at: datetime
     author: Optional[UserRead] = None
+    attachments: List["TicketAttachmentRead"] = Field(default_factory=list)
 
 
 class TicketAttachmentCreate(BaseSchema):
@@ -668,6 +680,10 @@ class TicketAttachmentRead(BaseSchema):
     ticket_id: str
     uploader_id: str
     name: str
+    original_name: Optional[str] = None
+    stored_name: Optional[str] = None
+    content_type: Optional[str] = None
+    comment_id: Optional[str] = None
     size_bytes: int = 0
     file_url: str = ""
     created_at: datetime

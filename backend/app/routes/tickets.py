@@ -1,5 +1,7 @@
 import os
 import uuid
+import json
+import time
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -32,6 +34,7 @@ from backend.app.models import (
     TicketComment,
     TicketAttachment,
     TicketActivity,
+    AuditLog,
 )
 from fastapi.responses import FileResponse
 from backend.app.schemas import (
@@ -57,17 +60,10 @@ from backend.app.core.websockets import ws_manager, authenticate_ws
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-ALLOWED_ATTACHMENT_EXTENSIONS = {
+ALLOWED_ATTACHMENT_EXTENSIONS = set(getattr(settings, "ATTACHMENT_ALLOWED_EXTENSIONS", [
     ".png", ".jpg", ".jpeg", ".gif", ".webp",
-    ".pdf", ".txt", ".json", ".csv", ".log", ".pcap", ".zip", ".md"
-}
-
-ALLOWED_ATTACHMENT_MIME_TYPES = {
-    "image/png", "image/jpeg", "image/gif", "image/webp",
-    "application/pdf", "text/plain", "application/json", "text/csv",
-    "application/zip", "application/x-zip-compressed", "application/octet-stream",
-    "text/markdown", "application/vnd.tcpdump.pcap"
-}
+    ".pdf", ".txt", ".json", ".csv", ".log"
+]))
 
 
 @router.websocket("/ws/{workspace_id}")
@@ -754,6 +750,242 @@ async def delete_ticket(
     return {"success": True, "message": "Ticket deleted", "id": ticket_id}
 
 
+_UPLOAD_RATE_LIMITS: Dict[str, List[float]] = {}
+
+
+def check_upload_rate_limit(user_id: str) -> None:
+    """Enforces rate limiting for uploads (429 with Retry-After)."""
+    now = time.time()
+    window = 60.0
+    timestamps = _UPLOAD_RATE_LIMITS.setdefault(user_id, [])
+    valid = [t for t in timestamps if now - t < window]
+    _UPLOAD_RATE_LIMITS[user_id] = valid
+    limit = getattr(settings, "ATTACHMENT_RATE_LIMIT_PER_MINUTE", 30)
+    if len(valid) >= limit:
+        oldest = valid[0]
+        retry_after = max(1, int(window - (now - oldest)))
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limit_exceeded", "message": f"Upload rate limit exceeded. Retry after {retry_after}s."},
+            headers={"Retry-After": str(retry_after)},
+        )
+    _UPLOAD_RATE_LIMITS[user_id].append(now)
+
+
+def validate_file_content(content: bytes, ext: str) -> str:
+    """
+    Validates file content strictly:
+    - Never trusts the client extension or MIME type.
+    - Rejects executables (PE, ELF, Mach-O, Java class).
+    - Rejects scripts (shebang, php, script tags).
+    - Rejects HTML and SVG.
+    - Rejects archives (ZIP, TAR, GZ, 7Z, RAR).
+    - Validates binary magic bytes for images (PNG, JPEG, WebP, GIF) and PDF.
+    - Validates valid UTF-8 text with no NUL bytes for text types (TXT, LOG, CSV, JSON).
+    - Checks that extension matches the verified content.
+    Returns the authoritative Content-Type.
+    """
+    if len(content) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_file", "message": "File is empty."}
+        )
+
+    # 1. Reject known dangerous / disallowed binary signatures
+    if content.startswith(b"MZ"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Executables (PE/EXE) are strictly prohibited."}
+        )
+    if content.startswith(b"\x7fELF"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Executables (ELF) are strictly prohibited."}
+        )
+    if len(content) >= 4 and content[:4] in (
+        b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Executable and compiled binary files are strictly prohibited."}
+        )
+    # Archives: ZIP/JAR, GZ, 7Z, RAR
+    if content.startswith(b"PK\x03\x04") or content.startswith(b"\x1f\x8b") or \
+       content.startswith(b"7z\xbc\xaf\x27\x1c") or content.startswith(b"Rar!\x1a\x07"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Archive files are strictly prohibited."}
+        )
+    if len(content) >= 265 and content[257:262] == b"ustar":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Tar archive files are strictly prohibited."}
+        )
+
+    # Check for scripts, HTML, SVG in the header
+    head_1024 = content[:1024].lower()
+    if head_1024.startswith(b"#!"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Script files are strictly prohibited."}
+        )
+    if b"<?php" in head_1024 or b"<script" in head_1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "Script content is strictly prohibited."}
+        )
+    if b"<svg" in head_1024 or (b"<?xml" in head_1024 and b"svg" in head_1024):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "SVG files are strictly prohibited."}
+        )
+    if b"<!doctype html" in head_1024 or b"<html" in head_1024 or b"<head" in head_1024 or b"<body" in head_1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": "HTML files are strictly prohibited."}
+        )
+
+    # 2. Check Binary Allowlist by magic bytes
+    detected_mime = None
+
+    # PNG: 89 50 4E 47 0D 0A 1A 0A
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_mime = "image/png"
+        if ext != ".png":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": f"File signature is PNG but extension is '{ext}'."}
+            )
+
+    # JPEG: FF D8 FF
+    elif content.startswith(b"\xff\xd8\xff"):
+        detected_mime = "image/jpeg"
+        if ext not in (".jpg", ".jpeg"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": f"File signature is JPEG but extension is '{ext}'."}
+            )
+
+    # WebP: RIFF....WEBP
+    elif content.startswith(b"RIFF") and len(content) >= 12 and content[8:12] == b"WEBP":
+        detected_mime = "image/webp"
+        if ext != ".webp":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": f"File signature is WebP but extension is '{ext}'."}
+            )
+
+    # GIF: GIF87a or GIF89a
+    elif content.startswith((b"GIF87a", b"GIF89a")):
+        detected_mime = "image/gif"
+        if ext != ".gif":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": f"File signature is GIF but extension is '{ext}'."}
+            )
+
+    # PDF: %PDF-
+    elif content.startswith(b"%PDF-"):
+        detected_mime = "application/pdf"
+        if ext != ".pdf":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": f"File signature is PDF but extension is '{ext}'."}
+            )
+
+    # 3. Check Text Allowlist (txt, log, csv, json)
+    elif ext in (".txt", ".log", ".csv", ".json"):
+        # Must contain NO NUL bytes
+        if b"\x00" in content:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": "Text files cannot contain NUL bytes."}
+            )
+        try:
+            text_str = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "disallowed_file_type", "message": "Text files must be valid UTF-8."}
+            )
+
+        if ext == ".json":
+            try:
+                json.loads(text_str)
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"code": "invalid_json", "message": "File extension is .json but content is not valid JSON."}
+                )
+            detected_mime = "application/json"
+        elif ext == ".csv":
+            detected_mime = "text/csv"
+        else:
+            detected_mime = "text/plain"
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": f"File type or extension '{ext}' is not permitted."}
+        )
+
+    # Verify extension is explicitly permitted in settings
+    allowed = getattr(settings, "ATTACHMENT_ALLOWED_EXTENSIONS", [
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".txt", ".log", ".csv", ".json"
+    ])
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "disallowed_file_type", "message": f"Extension '{ext}' is not in the allowed list."}
+        )
+
+    return detected_mime
+
+
+async def _get_authorized_ticket(ticket_id: str, current_user: User, db: AsyncSession) -> Ticket:
+    """Verifies ticket existence and server-side organization authorization from verified membership."""
+    res = await db.execute(
+        select(Ticket).options(selectinload(Ticket.project)).where(
+            or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id)
+        )
+    )
+    ticket = res.scalars().first()
+    if not ticket or not ticket.project:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Ticket not found"})
+
+    active_org_ids = {m.organization_id for m in current_user.memberships if m.status == "active"}
+    if current_user.organization_id:
+        active_org_ids.add(current_user.organization_id)
+
+    if ticket.project.organization_id not in active_org_ids:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Ticket not found"})
+
+    return ticket
+
+
+def _resolve_attachment_path(att: TicketAttachment) -> Optional[str]:
+    """Locates the attachment on disk safely without path traversal."""
+    possible_dirs = [
+        getattr(settings, "ATTACHMENT_UPLOAD_DIR", os.path.join(settings.UPLOAD_DIR, "ticket_attachments")),
+        os.path.join(settings.UPLOAD_DIR, "tickets"),
+    ]
+    for d in possible_dirs:
+        abs_d = os.path.abspath(d)
+        candidates = []
+        if att.stored_name:
+            candidates.append(os.path.abspath(os.path.join(abs_d, att.stored_name)))
+        candidates.append(os.path.abspath(os.path.join(abs_d, f"{att.id}_{att.filename}")))
+        if att.file_url:
+            candidates.append(os.path.abspath(os.path.join(abs_d, os.path.basename(att.file_url))))
+
+        for p in candidates:
+            if p.startswith(abs_d) and os.path.exists(p) and os.path.isfile(p):
+                return p
+    return None
+
+
 @router.post("/{ticket_id}/comments", response_model=TicketCommentRead, status_code=status.HTTP_201_CREATED)
 async def add_ticket_comment(
     ticket_id: str,
@@ -761,43 +993,93 @@ async def add_ticket_comment(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Add comment / triage note to ticket with workspace-scoped broadcast."""
-    t_res = await db.execute(select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id)))
-    ticket = t_res.scalars().first()
-    if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    """
+    Add comment to ticket with workspace-scoped broadcast.
+    Accepts optional attachment IDs (max 5 per comment).
+    A comment requires text content or at least one valid attachment.
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+
+    content_text = (comment_in.content or "").strip()
+    att_ids = comment_in.attachment_ids or []
+    if not content_text and not att_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_comment", "message": "A comment must have text content or at least one attachment."}
+        )
+
+    max_files_per_comment = getattr(settings, "ATTACHMENT_MAX_FILES_PER_COMMENT", 5)
+    if len(att_ids) > max_files_per_comment:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "attachment_limit_exceeded", "message": f"A comment can have at most {max_files_per_comment} attachments."}
+        )
+
+    verified_attachments = []
+    if att_ids:
+        att_res = await db.execute(
+            select(TicketAttachment).where(
+                TicketAttachment.ticket_id == ticket.id,
+                TicketAttachment.id.in_(att_ids)
+            )
+        )
+        verified_attachments = att_res.scalars().all()
+        if len(verified_attachments) != len(att_ids):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "invalid_attachments", "message": "One or more attachment IDs are invalid for this ticket."}
+            )
 
     now = datetime.now(timezone.utc)
     comment = TicketComment(
         ticket_id=ticket.id,
         author_id=current_user.id,
-        content=comment_in.content.strip(),
+        content=content_text,
         created_at=now,
     )
     db.add(comment)
+    await db.flush()
+
+    for att in verified_attachments:
+        att.comment_id = comment.id
 
     act = TicketActivity(
         ticket_id=ticket.id,
         actor_id=current_user.id,
         action="comment_added",
         old_value=None,
-        new_value=comment.content[:100],
+        new_value=content_text[:100] if content_text else f"{len(verified_attachments)} attachment(s)",
         created_at=now,
     )
     db.add(act)
     await db.commit()
 
     res = await db.execute(
-        select(TicketComment).options(selectinload(TicketComment.author)).where(TicketComment.id == comment.id)
+        select(TicketComment)
+        .options(
+            selectinload(TicketComment.author),
+            selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader)
+        )
+        .where(TicketComment.id == comment.id)
     )
     out_c = res.scalars().first()
 
-    workspace_id = ticket.project.organization_id if ticket.project else current_user.organization_id
+    workspace_id = ticket.project.organization_id
     await ws_manager.broadcast(
         workspace_id=workspace_id,
         event_type="comment_added",
-        data={"ticket_id": ticket_id, "comment": TicketCommentRead.model_validate(out_c).model_dump(mode="json")},
+        data={"ticket_id": ticket.id, "comment": TicketCommentRead.model_validate(out_c).model_dump(mode="json")},
     )
+    if verified_attachments:
+        await ws_manager.broadcast(
+            workspace_id=workspace_id,
+            event_type="ticket_attachment_changed",
+            data={
+                "ticket_id": ticket.id,
+                "action": "linked_to_comment",
+                "comment_id": comment.id
+            }
+        )
 
     return out_c
 
@@ -810,53 +1092,53 @@ async def upload_ticket_attachment(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Upload real binary attachment to ticket with server-side validation:
-    - Verifies ticket existence and project access authorization.
-    - Validates file extension against strict whitelist.
-    - Validates client MIME type.
-    - Enforces maximum file size limit (15MB) while reading binary chunks.
-    - Sanitizes filename to prevent directory traversal.
-    - Writes binary to disk at {settings.UPLOAD_DIR}/tickets/{safe_filename}.
-    - Records metadata (name, size_bytes, file_url) in ticket_attachments table.
-    - Broadcasts event to workspace channel.
+    Secure multipart upload endpoint:
+    - Rate limits uploads per user (429 with Retry-After).
+    - Verifies ticket existence and server-side organization authorization.
+    - Enforces per-ticket file count limit.
+    - Enforces max file size (10 MB default) while streaming in chunks.
+    - Validates binary magic bytes and text integrity (rejects executables, scripts, html, svg, archives).
+    - Stores file outside web root under random name, keeping sanitized original name in DB.
+    - Generates AuditLog entry (name, size, ticket; never contents).
+    - Broadcasts websocket event.
     """
-    res = await db.execute(
-        select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
-    )
-    ticket = res.scalars().first()
-    if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    check_upload_rate_limit(current_user.id)
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
 
-    # Sanitize filename and block path traversal
+    max_ticket_files = getattr(settings, "ATTACHMENT_MAX_FILES_PER_TICKET", 50)
+    count_res = await db.execute(
+        select(func.count(TicketAttachment.id)).where(TicketAttachment.ticket_id == ticket.id)
+    )
+    current_count = count_res.scalar() or 0
+    if current_count >= max_ticket_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "ticket_attachment_limit_exceeded", "message": f"Ticket attachment limit of {max_ticket_files} files reached."}
+        )
+
     raw_filename = file.filename or "attachment.bin"
     safe_name = os.path.basename(raw_filename).replace("..", "").strip()
     if not safe_name:
         safe_name = "attachment.bin"
 
-    # Validate file extension
     ext = Path(safe_name).suffix.lower()
-    if ext not in ALLOWED_ATTACHMENT_EXTENSIONS:
+    allowed_exts = set(getattr(settings, "ATTACHMENT_ALLOWED_EXTENSIONS", [
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".txt", ".log", ".csv", ".json"
+    ]))
+    if ext not in allowed_exts:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File extension '{ext}' is not permitted. Allowed extensions: {', '.join(sorted(ALLOWED_ATTACHMENT_EXTENSIONS))}"
+            detail={"code": "disallowed_file_type", "message": f"File extension '{ext}' is not permitted."}
         )
 
-    # Validate MIME type
-    if file.content_type and file.content_type.lower() not in ALLOWED_ATTACHMENT_MIME_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"MIME type '{file.content_type}' is not supported."
-        )
-
-    # Target directory on filesystem
-    ticket_upload_dir = os.path.join(settings.UPLOAD_DIR, "tickets")
-    os.makedirs(ticket_upload_dir, exist_ok=True)
+    upload_dir = getattr(settings, "ATTACHMENT_UPLOAD_DIR", os.path.join(settings.UPLOAD_DIR, "ticket_attachments"))
+    os.makedirs(upload_dir, exist_ok=True)
 
     att_id = str(uuid.uuid4())
-    stored_filename = f"{att_id}_{safe_name}"
-    destination_path = os.path.join(ticket_upload_dir, stored_filename)
+    stored_filename = f"{uuid.uuid4().hex}_{uuid.uuid4().hex}{ext}"
+    destination_path = os.path.abspath(os.path.join(upload_dir, stored_filename))
 
-    # Stream chunks and enforce MAX_ATTACHMENT_SIZE_BYTES
+    max_size = getattr(settings, "ATTACHMENT_MAX_FILE_SIZE_BYTES", 10 * 1024 * 1024)
     total_bytes = 0
     CHUNK_SIZE = 64 * 1024  # 64 KB
 
@@ -867,30 +1149,65 @@ async def upload_ticket_attachment(
                 if not chunk:
                     break
                 total_bytes += len(chunk)
-                if total_bytes > settings.MAX_ATTACHMENT_SIZE_BYTES:
+                if total_bytes > max_size:
                     buffer.close()
                     if os.path.exists(destination_path):
                         os.remove(destination_path)
-                    max_mb = settings.MAX_ATTACHMENT_SIZE_BYTES / (1024 * 1024)
+                    max_mb = max_size / (1024 * 1024)
                     raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=f"File exceeds maximum allowed upload size of {max_mb:.0f} MB."
+                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                        detail={"code": "file_too_large", "message": f"File exceeds maximum allowed upload size of {max_mb:.0f} MB."}
                     )
                 buffer.write(chunk)
+    except Exception:
+        if os.path.exists(destination_path):
+            try:
+                os.remove(destination_path)
+            except Exception:
+                pass
+        raise
     finally:
         await file.close()
+
+    try:
+        with open(destination_path, "rb") as f:
+            full_content = f.read()
+        detected_mime = validate_file_content(full_content, ext)
+    except HTTPException:
+        if os.path.exists(destination_path):
+            try:
+                os.remove(destination_path)
+            except Exception:
+                pass
+        raise
 
     now = datetime.now(timezone.utc)
     att = TicketAttachment(
         id=att_id,
         ticket_id=ticket.id,
         uploader_id=current_user.id,
-        name=safe_name,
+        filename=safe_name,
+        original_name=safe_name,
+        stored_name=stored_filename,
+        content_type=detected_mime,
         size_bytes=total_bytes,
         file_url=f"/api/v1/tickets/{ticket.id}/attachments/{att_id}/download",
         created_at=now,
     )
     db.add(att)
+
+    audit_entry = AuditLog(
+        organization_id=ticket.project.organization_id,
+        actor_id=current_user.id,
+        action="ticket_attachment_uploaded",
+        details=json.dumps({
+            "name": safe_name,
+            "size_bytes": total_bytes,
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number
+        })
+    )
+    db.add(audit_entry)
 
     act = TicketActivity(
         ticket_id=ticket.id,
@@ -908,15 +1225,40 @@ async def upload_ticket_attachment(
     )
     out_att = res_att.scalars().first()
 
-    # Broadcast event to workspace
-    workspace_id = ticket.project.organization_id if ticket.project else current_user.organization_id
+    workspace_id = ticket.project.organization_id
     await ws_manager.broadcast(
         workspace_id=workspace_id,
         event_type="attachment_added",
-        data={"ticket_id": ticket_id, "attachment": TicketAttachmentRead.model_validate(out_att).model_dump(mode="json")}
+        data={"ticket_id": ticket.id, "attachment": TicketAttachmentRead.model_validate(out_att).model_dump(mode="json")}
+    )
+    await ws_manager.broadcast(
+        workspace_id=workspace_id,
+        event_type="ticket_attachment_changed",
+        data={
+            "ticket_id": ticket.id,
+            "action": "added",
+            "attachment": TicketAttachmentRead.model_validate(out_att).model_dump(mode="json")
+        }
     )
 
     return out_att
+
+
+@router.get("/{ticket_id}/attachments", response_model=List[TicketAttachmentRead])
+async def list_ticket_attachments(
+    ticket_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List attachments for an authorized ticket."""
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    res = await db.execute(
+        select(TicketAttachment)
+        .options(selectinload(TicketAttachment.uploader))
+        .where(TicketAttachment.ticket_id == ticket.id)
+        .order_by(TicketAttachment.created_at.desc())
+    )
+    return res.scalars().all()
 
 
 @router.get("/{ticket_id}/attachments/{attachment_id}/download")
@@ -927,48 +1269,171 @@ async def download_ticket_attachment(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Authenticated attachment streaming endpoint.
-    Verifies user authentication, organization / project access authorization,
-    checks file existence on disk, and securely streams binary via FileResponse.
+    Authenticated download endpoint:
+    - Enforces Content-Disposition: attachment
+    - Enforces Content-Type and X-Content-Type-Options: nosniff
+    - Never exposes internal server paths.
     """
-    res = await db.execute(
-        select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
-    )
-    ticket = res.scalars().first()
-    if not ticket or not ticket.project or ticket.project.organization_id != current_user.organization_id:
-        raise HTTPException(status_code=404, detail="Ticket not found")
-
-    # Locate attachment record
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
     att_res = await db.execute(
         select(TicketAttachment).where(
-            TicketAttachment.ticket_id == ticket_id,
-            (TicketAttachment.id == attachment_id) | (TicketAttachment.file_url.ilike(f"%{attachment_id}%"))
+            TicketAttachment.ticket_id == ticket.id,
+            or_(TicketAttachment.id == attachment_id, TicketAttachment.file_url.ilike(f"%{attachment_id}%"))
         )
     )
     att = att_res.scalars().first()
     if not att:
-        raise HTTPException(status_code=404, detail="Attachment record not found")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Attachment record not found"})
 
-    ticket_upload_dir = os.path.abspath(os.path.join(settings.UPLOAD_DIR, "tickets"))
-    # Check deterministic primary storage path
-    candidate_path = os.path.abspath(os.path.join(ticket_upload_dir, f"{att.id}_{att.name}"))
-    if not os.path.exists(candidate_path):
-        # Fallback to stored basename for legacy files
-        legacy_basename = os.path.basename(att.file_url)
-        candidate_path = os.path.abspath(os.path.join(ticket_upload_dir, legacy_basename))
+    candidate_path = _resolve_attachment_path(att)
+    if not candidate_path or not os.path.exists(candidate_path) or not os.path.isfile(candidate_path):
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Attachment file not found on storage"})
 
-    # Path traversal validation
-    if not candidate_path.startswith(ticket_upload_dir):
-        raise HTTPException(status_code=400, detail="Invalid attachment path")
-
-    if not os.path.exists(candidate_path) or not os.path.isfile(candidate_path):
-        raise HTTPException(status_code=404, detail="Attachment binary not found on server storage")
-
+    filename = att.original_name or att.filename
     return FileResponse(
         path=candidate_path,
-        filename=att.name,
-        media_type="application/octet-stream"
+        filename=filename,
+        media_type=att.content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff"
+        }
     )
+
+
+@router.get("/{ticket_id}/attachments/{attachment_id}/preview")
+async def preview_ticket_attachment(
+    ticket_id: str,
+    attachment_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Authenticated inline preview endpoint for image attachments only:
+    - Enforces Content-Disposition: inline
+    - Enforces Content-Type and X-Content-Type-Options: nosniff
+    - Rejects non-image types.
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    att_res = await db.execute(
+        select(TicketAttachment).where(
+            TicketAttachment.ticket_id == ticket.id,
+            or_(TicketAttachment.id == attachment_id, TicketAttachment.file_url.ilike(f"%{attachment_id}%"))
+        )
+    )
+    att = att_res.scalars().first()
+    if not att:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Attachment record not found"})
+
+    if att.content_type not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "preview_not_supported", "message": "Inline preview is only supported for image attachments."}
+        )
+
+    candidate_path = _resolve_attachment_path(att)
+    if not candidate_path or not os.path.exists(candidate_path) or not os.path.isfile(candidate_path):
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Attachment file not found on storage"})
+
+    filename = att.original_name or att.filename
+    return FileResponse(
+        path=candidate_path,
+        filename=filename,
+        media_type=att.content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff"
+        }
+    )
+
+
+@router.delete("/{ticket_id}/attachments/{attachment_id}")
+async def delete_ticket_attachment(
+    ticket_id: str,
+    attachment_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete attachment endpoint:
+    - Only the uploader and organization owner/admin may delete.
+    - Removes the stored file from disk.
+    - Records an AuditLog entry.
+    """
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+    att_res = await db.execute(
+        select(TicketAttachment).where(
+            TicketAttachment.ticket_id == ticket.id,
+            or_(TicketAttachment.id == attachment_id, TicketAttachment.file_url.ilike(f"%{attachment_id}%"))
+        )
+    )
+    att = att_res.scalars().first()
+    if not att:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Attachment record not found"})
+
+    # Check delete permissions: only uploader or organization owner/admin
+    is_uploader = (current_user.id == att.uploader_id)
+    is_org_admin = (current_user.role in ("owner", "admin"))
+    if not is_org_admin and current_user.memberships:
+        for m in current_user.memberships:
+            if m.organization_id == ticket.project.organization_id and m.role in ("owner", "admin") and m.status == "active":
+                is_org_admin = True
+                break
+
+    if not (is_uploader or is_org_admin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "permission_denied", "message": "Only the uploader and organization owners or admins may delete attachments."}
+        )
+
+    file_path = _resolve_attachment_path(att)
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            logger.warning(f"Failed to delete attachment file from storage: {e}")
+
+    att_name = att.original_name or att.filename
+    att_size = att.size_bytes
+    await db.delete(att)
+
+    audit_entry = AuditLog(
+        organization_id=ticket.project.organization_id,
+        actor_id=current_user.id,
+        action="ticket_attachment_deleted",
+        details=json.dumps({
+            "name": att_name,
+            "size_bytes": att_size,
+            "ticket_id": ticket.id,
+            "ticket_number": ticket.ticket_number
+        })
+    )
+    db.add(audit_entry)
+
+    act = TicketActivity(
+        ticket_id=ticket.id,
+        actor_id=current_user.id,
+        action="attachment_deleted",
+        old_value=att_name,
+        new_value=None,
+        created_at=datetime.now(timezone.utc)
+    )
+    db.add(act)
+    await db.commit()
+
+    workspace_id = ticket.project.organization_id
+    await ws_manager.broadcast(
+        workspace_id=workspace_id,
+        event_type="attachment_deleted",
+        data={"ticket_id": ticket.id, "attachment_id": attachment_id}
+    )
+    await ws_manager.broadcast(
+        workspace_id=workspace_id,
+        event_type="ticket_attachment_changed",
+        data={"ticket_id": ticket.id, "action": "deleted", "attachment_id": attachment_id}
+    )
+
+    return {"success": True, "message": "Attachment deleted", "id": attachment_id}
 
 
 # =========================================================================

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, text, UniqueConstraint
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, Index, text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 from backend.app.database import Base
 
@@ -181,6 +181,7 @@ class Ticket(Base):
     rca_trigger: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     rca_mitigation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     rca_action_items: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
@@ -190,6 +191,7 @@ class Ticket(Base):
     comments: Mapped[list["TicketComment"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
     attachments: Mapped[list["TicketAttachment"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
     activities: Mapped[list["TicketActivity"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
+    handoffs: Mapped[list["TicketHandoff"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", lazy="selectin")
 
     @property
     def is_breached(self) -> bool:
@@ -223,6 +225,7 @@ class TicketComment(Base):
 
     ticket: Mapped["Ticket"] = relationship(back_populates="comments")
     author: Mapped["User"] = relationship("User")
+    attachments: Mapped[list["TicketAttachment"]] = relationship("TicketAttachment", back_populates="comment")
 
 
 class TicketAttachment(Base):
@@ -230,15 +233,55 @@ class TicketAttachment(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     ticket_id: Mapped[str] = mapped_column(String(36), ForeignKey("tickets.id"), nullable=False)
+    comment_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("ticket_comments.id", ondelete="SET NULL"), nullable=True)
     uploader_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    original_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stored_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     file_type: Mapped[str] = mapped_column(String(100), default="log")
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     file_url: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
+    __table_args__ = (
+        Index("ix_ticket_attachments_ticket_id_created_at", "ticket_id", "created_at"),
+    )
+
     ticket: Mapped["Ticket"] = relationship(back_populates="attachments")
     uploader: Mapped["User"] = relationship("User")
+    comment: Mapped[Optional["TicketComment"]] = relationship("TicketComment", back_populates="attachments")
+
+    @property
+    def name(self) -> str:
+        return self.original_name or self.filename
+
+    @name.setter
+    def name(self, val: str) -> None:
+        self.filename = val
+        self.original_name = val
+
+
+class TicketHandoff(Base):
+    __tablename__ = "ticket_handoffs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    ticket_id: Mapped[str] = mapped_column(String(36), ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False)
+    from_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    to_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status_before: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    status_after: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20), default="pass", server_default=text("'pass'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        Index("ix_ticket_handoffs_ticket_id_created_at", "ticket_id", "created_at"),
+    )
+
+    ticket: Mapped["Ticket"] = relationship(back_populates="handoffs")
+    from_user: Mapped["User"] = relationship("User", foreign_keys=[from_user_id])
+    to_user: Mapped["User"] = relationship("User", foreign_keys=[to_user_id])
 
 
 class TicketActivity(Base):

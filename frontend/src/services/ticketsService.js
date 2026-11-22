@@ -55,7 +55,12 @@ export const ticketsService = {
     return res.data;
   },
 
-  addAttachment: async (ticketId, fileOrFormData) => {
+  getAttachments: async (ticketId) => {
+    const res = await apiClient.get(`/tickets/${ticketId}/attachments`);
+    return res.data;
+  },
+
+  addAttachment: async (ticketId, fileOrFormData, onUploadProgress) => {
     let payload = fileOrFormData;
     let headers = {};
     if (fileOrFormData instanceof File) {
@@ -67,7 +72,38 @@ export const ticketsService = {
       payload = fileOrFormData;
       headers = { 'Content-Type': 'multipart/form-data' };
     }
-    const res = await apiClient.post(`/tickets/${ticketId}/attachments`, payload, { headers });
+    const res = await apiClient.post(`/tickets/${ticketId}/attachments`, payload, {
+      headers,
+      onUploadProgress,
+    });
+    return res.data;
+  },
+
+  getAttachmentPreviewBlob: async (ticketId, attachmentId) => {
+    const res = await apiClient.get(`/tickets/${ticketId}/attachments/${attachmentId}/preview`, {
+      responseType: 'blob',
+    });
+    return res.data;
+  },
+
+  downloadAttachment: async (ticketId, attachmentId, fileName = 'attachment') => {
+    const res = await apiClient.get(`/tickets/${ticketId}/attachments/${attachmentId}/download`, {
+      responseType: 'blob',
+    });
+    const blob = new Blob([res.data], { type: res.headers?.['content-type'] || 'application/octet-stream' });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', fileName);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+    return true;
+  },
+
+  deleteAttachment: async (ticketId, attachmentId) => {
+    const res = await apiClient.delete(`/tickets/${ticketId}/attachments/${attachmentId}`);
     return res.data;
   },
 
