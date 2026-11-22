@@ -638,20 +638,12 @@ async def update_ticket(
     update_data = ticket_in.model_dump(exclude_unset=True)
     now = datetime.now(timezone.utc)
 
-    # Activity logging for status / severity transitions
+    # Status updates must use dedicated verified lifecycle actions
     if "status" in update_data and update_data["status"]:
-        new_status = update_data["status"].lower()
-        if new_status != ticket.status:
-            act = TicketActivity(
-                ticket_id=ticket.id,
-                actor_id=current_user.id,
-                action="status_changed",
-                old_value=ticket.status,
-                new_value=new_status,
-                created_at=now,
-            )
-            db.add(act)
-            ticket.status = new_status
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "direct_status_update_forbidden", "message": "Direct status updates are not allowed. Use the dedicated lifecycle transition endpoints (/accept, /pass, /hold, /resume, /close, /reopen, /reassign)."}
+        )
 
     if "severity" in update_data and update_data["severity"]:
         new_sev = update_data["severity"].lower()
@@ -676,6 +668,11 @@ async def update_ticket(
     if "assignee_id" in update_data:
         new_assignee = update_data["assignee_id"]
         if new_assignee != ticket.assignee_id:
+            if (ticket.status or "").lower() not in ("open",):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "direct_reassign_forbidden", "message": "Active tickets cannot be reassigned directly. Use the /pass or /reassign endpoints."}
+                )
             act = TicketActivity(
                 ticket_id=ticket.id,
                 actor_id=current_user.id,
@@ -1550,7 +1547,7 @@ ALLOWED_LIFECYCLE_TRANSITIONS = {
 }
 
 
-@router.patch("/{ticket_id}/status", response_model=TicketRead)
+@router.patch("/{ticket_id}/status", response_model=TicketRead, deprecated=True)
 async def change_ticket_status(
     ticket_id: str,
     payload: TicketStatusChangeRequest,
@@ -1558,7 +1555,9 @@ async def change_ticket_status(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Screen 66B: Dedicated status change endpoint with strict server-side lifecycle enforcement.
+    DEPRECATED: Direct status patch endpoint. All lifecycle transitions should use
+    the dedicated verified endpoints (/accept, /pass, /hold, /resume, /close, /reopen, /reassign).
+    Retained with strict HTTP 409 guardrails.
     """
     res = await db.execute(
         select(Ticket).options(selectinload(Ticket.project)).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
@@ -1579,6 +1578,12 @@ async def change_ticket_status(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "invalid_transition", "message": "The 'resolved' status is no longer reachable by any transition."}
+        )
+
+    if new_status == "passed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "pass_endpoint_required", "message": "Tickets cannot be passed via direct status update. Use the /pass endpoint with a required message and target colleague."}
         )
 
     old_status = ticket.status.lower()
@@ -1788,6 +1793,11 @@ async def reassign_ticket(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "owner_required", "message": "Only the organization owner can reassign tickets. Use the /pass endpoint for member handoffs."}
         )
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "reassign_endpoint_required", "message": "Direct assignee patching is deprecated. Reassigning a ticket must use the /reassign endpoint with required message and handoff tracking."}
+    )
 
     new_assignee_id = payload.assignee_id
     assignee_name = "Unassigned"
