@@ -163,6 +163,12 @@ def _format_task_activity_summary(
 
 def _format_task_activity_read(act: TaskActivity, actor: Optional[User]) -> TaskActivityRead:
     actor_name = _get_actor_display_name(actor)
+    old_display = act.old_value
+    new_display = act.new_value
+    if act.action == "assignee_changed":
+        meta = act.meta or {}
+        old_display = meta.get("old_assignee_name") or "Unassigned"
+        new_display = meta.get("new_assignee_name") or "Unassigned"
     return TaskActivityRead(
         id=act.id,
         task_id=act.task_id,
@@ -172,10 +178,10 @@ def _format_task_activity_read(act: TaskActivity, actor: Optional[User]) -> Task
         actor_avatar=actor.avatar_url if actor else None,
         action=act.action,
         field_name=act.field_name,
-        old_value=act.old_value,
-        new_value=act.new_value,
+        old_value=old_display,
+        new_value=new_display,
         summary=_format_task_activity_summary(
-            act.action, act.field_name, act.old_value, act.new_value, actor_name, act.meta
+            act.action, act.field_name, old_display, new_display, actor_name, act.meta
         ),
         meta=act.meta,
         created_at=act.created_at,

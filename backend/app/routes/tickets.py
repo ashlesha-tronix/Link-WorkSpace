@@ -762,12 +762,26 @@ async def update_ticket(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={"code": "direct_reassign_forbidden", "message": "Active tickets cannot be reassigned directly. Use the /pass or /reassign endpoints."}
                 )
+            old_name = "unassigned"
+            if ticket.assignee:
+                old_name = ticket.assignee.display_name or ticket.assignee.full_name or "Unknown User"
+            elif ticket.assignee_id:
+                old_u = (await db.execute(select(User).where(User.id == ticket.assignee_id))).scalars().first()
+                if old_u:
+                    old_name = old_u.display_name or old_u.full_name or "Unknown User"
+
+            new_name = "unassigned"
+            if new_assignee:
+                new_u = (await db.execute(select(User).where(User.id == new_assignee))).scalars().first()
+                if new_u:
+                    new_name = new_u.display_name or new_u.full_name or "Unknown User"
+
             act = TicketActivity(
                 ticket_id=ticket.id,
                 actor_id=current_user.id,
                 action="reassigned",
-                old_value=ticket.assignee_id or "unassigned",
-                new_value=new_assignee or "unassigned",
+                old_value=old_name,
+                new_value=new_name,
                 created_at=now,
             )
             db.add(act)
@@ -2037,7 +2051,14 @@ async def reassign_ticket(
         assignee_name = target_user.full_name or target_user.email
 
     now = datetime.now(timezone.utc)
-    old_assignee = ticket.assignee_id or "unassigned"
+    old_assignee = "unassigned"
+    if ticket.assignee:
+        old_assignee = ticket.assignee.display_name or ticket.assignee.full_name or "Unknown User"
+    elif ticket.assignee_id:
+        old_u = (await db.execute(select(User).where(User.id == ticket.assignee_id))).scalars().first()
+        if old_u:
+            old_assignee = old_u.display_name or old_u.full_name or "Unknown User"
+
     act_parts = [f"Reassigned to {assignee_name}"]
     if payload.reason:
         act_parts.append(f"Reason: {payload.reason.strip()}")

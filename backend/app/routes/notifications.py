@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database import get_db
 from backend.app.dependencies import get_current_active_user
-from backend.app.models import Notification, User
+from backend.app.models import Notification, User, Membership, Ticket
 from backend.app.core.websockets import ws_manager, authenticate_ws
 
 router = APIRouter()
@@ -44,6 +44,7 @@ class NotificationItem(BaseModel):
     actor: Optional[NotificationActor] = None
     target_id: Optional[str] = None
     target_type: Optional[str] = None
+    target_label: Optional[str] = None
     target_route: Optional[str] = None
 
 
@@ -72,7 +73,11 @@ class BulkMarkReadResponse(BaseModel):
     marked_count: int
 
 
-def _format_notification_item(n: Notification) -> NotificationItem:
+def _format_notification_item(
+    n: Notification,
+    user_name_map: Optional[dict] = None,
+    ticket_map: Optional[dict] = None,
+) -> NotificationItem:
     actor = None
     if n.actor:
         actor = NotificationActor(
@@ -80,6 +85,22 @@ def _format_notification_item(n: Notification) -> NotificationItem:
             name=n.actor.full_name or n.actor.email,
             avatar_url=n.actor.avatar_url,
         )
+    user_name_map = user_name_map or {}
+    ticket_map = ticket_map or {}
+
+    target_label = None
+    if n.target_type == "user" or (n.target_id and n.target_id.startswith("usr_")):
+        if n.target_id in user_name_map:
+            target_label = f"User: {user_name_map[n.target_id]}"
+        else:
+            target_label = "User: Team Member"
+    elif n.target_type == "ticket" and n.target_id:
+        target_label = ticket_map.get(n.target_id, n.target_id)
+    elif n.target_type == "join_request":
+        target_label = "Join Request"
+    elif n.target_id and not n.target_id.startswith("usr_"):
+        target_label = n.target_id
+
     return NotificationItem(
         id=n.id,
         type=n.type,
@@ -90,6 +111,7 @@ def _format_notification_item(n: Notification) -> NotificationItem:
         actor=actor,
         target_id=n.target_id,
         target_type=n.target_type,
+        target_label=target_label,
         target_route=n.target_route,
     )
 
@@ -153,7 +175,44 @@ async def list_notifications(
     res = await db.execute(query)
     notifications = res.scalars().all()
 
-    items = [_format_notification_item(n) for n in notifications]
+    user_ids = {
+        n.target_id
+        for n in notifications
+        if n.target_id and (n.target_type == "user" or n.target_id.startswith("usr_"))
+    }
+    ticket_ids = {
+        n.target_id
+        for n in notifications
+        if n.target_id and n.target_type == "ticket" and not n.target_id.startswith("TKT-")
+    }
+
+    user_name_map = {}
+    if user_ids:
+        u_res = await db.execute(
+            select(User)
+            .join(Membership, Membership.user_id == User.id)
+            .where(
+                User.id.in_(user_ids),
+                Membership.organization_id == current_user.organization_id,
+                Membership.status == "active",
+            )
+        )
+        for u in u_res.scalars().all():
+            user_name_map[u.id] = u.display_name or u.full_name or u.email
+
+    ticket_map = {}
+    if ticket_ids:
+        t_res = await db.execute(
+            select(Ticket.id, Ticket.ticket_number).where(
+                Ticket.id.in_(ticket_ids),
+                Ticket.organization_id == current_user.organization_id,
+            )
+        )
+        for tid, tnum in t_res.all():
+            if tnum:
+                ticket_map[tid] = tnum
+
+    items = [_format_notification_item(n, user_name_map, ticket_map) for n in notifications]
 
     return NotificationListResponse(
         items=items,

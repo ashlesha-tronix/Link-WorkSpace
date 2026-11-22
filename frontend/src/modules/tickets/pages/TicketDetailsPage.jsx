@@ -1114,10 +1114,15 @@ export const TicketDetailsPage = () => {
                       </div>
                       <div className="space-y-1 min-w-0">
                         <p className="font-body-sm text-body-sm text-text-primary leading-tight">
-                          <strong className="font-semibold">{act.action}</strong>: {act.new_value || act.old_value || 'Lifecycle update'}
+                          <strong className="font-semibold">{act.action}</strong>:{' '}
+                          {act.action === 'reassigned' && (act.new_value?.startsWith('usr_') || act.old_value?.startsWith('usr_'))
+                            ? `Reassigned to ${ticket.assignee?.full_name || ticket.assignee?.display_name || 'team member'}`
+                            : (act.new_value?.includes('usr_') || act.old_value?.includes('usr_'))
+                              ? (act.new_value || act.old_value || 'Lifecycle update').replace(/usr_[a-zA-Z0-9_-]+/g, ticket.assignee?.full_name || 'team member')
+                              : (act.new_value || act.old_value || 'Lifecycle update')}
                         </p>
                         <p className="font-mono text-xs text-text-muted">
-                          {new Date(act.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} • User Action
+                          {new Date(act.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} • {act.actor?.full_name || act.actor?.display_name || 'User Action'}
                         </p>
                       </div>
                     </div>

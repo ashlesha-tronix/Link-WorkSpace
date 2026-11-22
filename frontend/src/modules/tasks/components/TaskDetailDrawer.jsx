@@ -55,6 +55,17 @@ const formatActivitySummary = (act) => {
     const toVal = act.new_value ? TASK_STATUS_LABEL[act.new_value] || act.new_value : 'updated';
     return `${actorName} changed status from ${fromVal} to ${toVal}`;
   }
+  if (act.action === 'assignee_changed') {
+    const fromVal =
+      act.meta?.old_assignee_name ||
+      (act.old_value && !act.old_value.startsWith('usr_') ? act.old_value : null) ||
+      'Unassigned';
+    const toVal =
+      act.meta?.new_assignee_name ||
+      (act.new_value && !act.new_value.startsWith('usr_') ? act.new_value : null) ||
+      'Unassigned';
+    return `${actorName} changed assignee from ${fromVal} to ${toVal}`;
+  }
   if (act.action === 'field_changed') {
     const field = act.field_name || 'details';
     let fromVal = act.old_value || 'none';
