@@ -93,6 +93,21 @@ class TicketStatus(str, Enum):
     closed = "closed"
 
 
+# Authoritative shared definition of an "open ticket" (active, non-terminal work items)
+OPEN_TICKET_STATUSES: tuple[str, ...] = (
+    TicketStatus.open.value,
+    TicketStatus.in_progress.value,
+    TicketStatus.wip.value,
+    TicketStatus.passed.value,
+    TicketStatus.on_hold.value,
+)
+
+CLOSED_TICKET_STATUSES: tuple[str, ...] = (
+    TicketStatus.closed.value,
+    TicketStatus.resolved.value,
+)
+
+
 class TicketSeverity(str, Enum):
     blocker = "blocker"
     critical = "critical"

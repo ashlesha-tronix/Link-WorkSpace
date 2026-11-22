@@ -733,6 +733,21 @@ class TicketActivityRead(BaseSchema):
     actor: Optional[UserRead] = None
 
 
+class TicketHandoffRead(BaseSchema):
+    id: str
+    ticket_id: str
+    from_user_id: str
+    to_user_id: str
+    from_user: Optional[UserRead] = None
+    to_user: Optional[UserRead] = None
+    message: Optional[str] = None
+    status_before: Optional[str] = None
+    status_after: Optional[str] = None
+    kind: str = "pass"
+    created_at: datetime
+    attachments: List[TicketAttachmentRead] = Field(default_factory=list)
+
+
 class TicketRead(TicketBase):
     id: str
     ticket_number: str
@@ -746,6 +761,7 @@ class TicketRead(TicketBase):
     comments: List[TicketCommentRead] = Field(default_factory=list)
     attachments: List[TicketAttachmentRead] = Field(default_factory=list)
     activities: List[TicketActivityRead] = Field(default_factory=list)
+    handoffs: List[TicketHandoffRead] = Field(default_factory=list)
     is_breached: bool = False
     breached_at: Optional[datetime] = None
     overrun_duration: Optional[str] = None
@@ -756,6 +772,7 @@ class TicketStats(BaseSchema):
     total: int = 0
     open: int = 0
     wip: int = 0
+    passed: int = 0
     on_hold: int = 0
     resolved: int = 0
     closed: int = 0

@@ -60,6 +60,11 @@ export const ticketsService = {
     return res.data;
   },
 
+  getHandoffs: async (ticketId) => {
+    const res = await apiClient.get(`/tickets/${ticketId}/handoffs`);
+    return res.data;
+  },
+
   addAttachment: async (ticketId, fileOrFormData, onUploadProgress) => {
     let payload = fileOrFormData;
     let headers = {};

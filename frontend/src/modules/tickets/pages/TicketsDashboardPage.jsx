@@ -37,6 +37,7 @@ export const TicketsDashboardPage = () => {
     setStatusFilter,
     slaFilter,
     setSlaFilter,
+    hasResolvedTickets,
     refetch,
   } = useTickets({
     initialSearch: urlSearch,
@@ -122,10 +123,11 @@ export const TicketsDashboardPage = () => {
         onStatusChange={handleStatusChange}
         onOpenCreateModal={() => setShowCreateModal(true)}
         isWsConnected={isWsConnected}
+        hasResolvedTickets={hasResolvedTickets}
       />
 
       {/* Summary KPI Stat Cards Row (Screen 61) */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-space-sm" role="region" aria-label="Ticket Summary Cards">
+      <div className={`grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 ${(stats?.resolved ?? 0) > 0 || hasResolvedTickets ? 'xl:grid-cols-7' : 'xl:grid-cols-6'} gap-space-sm`} role="region" aria-label="Ticket Summary Cards">
         {/* Total */}
         <button
           type="button"
@@ -220,6 +222,39 @@ export const TicketsDashboardPage = () => {
           </div>
         </button>
 
+        {/* Passed */}
+        <button
+          type="button"
+          onClick={() => handleStatusCardClick('passed')}
+          aria-label={`Show ${stats?.passed ?? 0} passed tickets`}
+          className={`text-left w-full p-space-md rounded-xl shadow-sm flex flex-col justify-between transition-all cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-purple-500 ${
+            statusFilter === 'passed'
+              ? 'bg-surface-card ring-2 ring-purple-500 border-purple-500 shadow-md'
+              : 'bg-surface-card hover:bg-canvas-lavender/30 border border-border-subtle/50'
+          }`}
+        >
+          <div className="flex items-center justify-between text-text-secondary">
+            <span className="font-label-md text-label-md">Passed</span>
+            <span className="material-symbols-outlined text-purple-600 dark:text-purple-400 text-lg">forward</span>
+          </div>
+          <div className="mt-3 flex items-baseline justify-between">
+            <span className="font-headline-lg text-headline-lg text-text-primary font-bold">
+              {stats?.passed ?? 0}
+            </span>
+            {hasTotal && (
+              <span className="font-label-sm text-label-sm text-purple-600 dark:text-purple-400">
+                {Math.round(((stats?.passed ?? 0) / totalCount) * 100)}%
+              </span>
+            )}
+          </div>
+          <div className="w-full bg-canvas-lavender h-1 rounded-full mt-3 overflow-hidden">
+            <div
+              className="bg-purple-500 h-full transition-all duration-300"
+              style={{ width: `${hasTotal ? Math.round(((stats?.passed ?? 0) / totalCount) * 100) : 0}%` }}
+            />
+          </div>
+        </button>
+
         {/* On Hold */}
         <button
           type="button"
@@ -253,38 +288,40 @@ export const TicketsDashboardPage = () => {
           </div>
         </button>
 
-        {/* Resolved */}
-        <button
-          type="button"
-          onClick={() => handleStatusCardClick('resolved')}
-          aria-label={`Show ${stats?.resolved ?? 0} resolved tickets`}
-          className={`text-left w-full p-space-md rounded-xl shadow-sm flex flex-col justify-between transition-all cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-status-resolved ${
-            statusFilter === 'resolved'
-              ? 'bg-surface-card ring-2 ring-status-resolved border-status-resolved shadow-md'
-              : 'bg-surface-card hover:bg-canvas-lavender/30 border border-border-subtle/50'
-          }`}
-        >
-          <div className="flex items-center justify-between text-text-secondary">
-            <span className="font-label-md text-label-md">Resolved</span>
-            <span className="material-symbols-outlined text-status-resolved text-lg">task_alt</span>
-          </div>
-          <div className="mt-3 flex items-baseline justify-between">
-            <span className="font-headline-lg text-headline-lg text-text-primary font-bold">
-              {stats?.resolved ?? 0}
-            </span>
-            {hasTotal && (
-              <span className="font-label-sm text-label-sm text-status-resolved">
-                {Math.round(((stats?.resolved ?? 0) / totalCount) * 100)}%
+        {/* Resolved (Legacy) - Shown only when legacy resolved tickets exist */}
+        {((stats?.resolved ?? 0) > 0 || hasResolvedTickets) && (
+          <button
+            type="button"
+            onClick={() => handleStatusCardClick('resolved')}
+            aria-label={`Show ${stats?.resolved ?? 0} resolved tickets`}
+            className={`text-left w-full p-space-md rounded-xl shadow-sm flex flex-col justify-between transition-all cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-status-resolved ${
+              statusFilter === 'resolved'
+                ? 'bg-surface-card ring-2 ring-status-resolved border-status-resolved shadow-md'
+                : 'bg-surface-card hover:bg-canvas-lavender/30 border border-border-subtle/50'
+            }`}
+          >
+            <div className="flex items-center justify-between text-text-secondary">
+              <span className="font-label-md text-label-md">Legacy: Resolved</span>
+              <span className="material-symbols-outlined text-status-resolved text-lg">task_alt</span>
+            </div>
+            <div className="mt-3 flex items-baseline justify-between">
+              <span className="font-headline-lg text-headline-lg text-text-primary font-bold">
+                {stats?.resolved ?? 0}
               </span>
-            )}
-          </div>
-          <div className="w-full bg-canvas-lavender h-1 rounded-full mt-3 overflow-hidden">
-            <div
-              className="bg-status-resolved h-full transition-all duration-300"
-              style={{ width: `${hasTotal ? Math.round(((stats?.resolved ?? 0) / totalCount) * 100) : 0}%` }}
-            />
-          </div>
-        </button>
+              {hasTotal && (
+                <span className="font-label-sm text-label-sm text-status-resolved">
+                  {Math.round(((stats?.resolved ?? 0) / totalCount) * 100)}%
+                </span>
+              )}
+            </div>
+            <div className="w-full bg-canvas-lavender h-1 rounded-full mt-3 overflow-hidden">
+              <div
+                className="bg-status-resolved h-full transition-all duration-300"
+                style={{ width: `${hasTotal ? Math.round(((stats?.resolved ?? 0) / totalCount) * 100) : 0}%` }}
+              />
+            </div>
+          </button>
+        )}
 
         {/* SLA Breached Attention Card (Button) */}
         <button
@@ -522,7 +559,11 @@ export const TicketsDashboardPage = () => {
                       {/* Status Badge */}
                       <td className="py-3 px-4">
                         <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full font-label-sm text-label-sm font-semibold ${stConfig.badge}`}>
-                          {stConfig.label}
+                          {stKey === 'passed'
+                            ? (t.assignee?.full_name ? `Passed to ${t.assignee.full_name}` : 'Passed')
+                            : stKey === 'resolved'
+                            ? 'Legacy: resolved'
+                            : stConfig.label}
                         </span>
                       </td>
 

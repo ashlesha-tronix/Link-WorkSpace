@@ -15,6 +15,7 @@ export const TicketViewSwitcher = ({
   onStatusChange,
   onOpenCreateModal,
   isWsConnected = false,
+  hasResolvedTickets = false,
 }) => {
   return (
     <div className="flex flex-col gap-space-md">
@@ -114,8 +115,11 @@ export const TicketViewSwitcher = ({
                 <option value="all">Status: All</option>
                 <option value="open">Open</option>
                 <option value="wip">In Progress</option>
+                <option value="passed">Passed</option>
                 <option value="on_hold">On Hold</option>
-                <option value="resolved">Resolved</option>
+                {hasResolvedTickets && (
+                  <option value="resolved">Legacy: resolved</option>
+                )}
                 <option value="closed">Closed</option>
               </select>
             </div>

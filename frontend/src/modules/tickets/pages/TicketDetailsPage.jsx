@@ -6,6 +6,7 @@ import { STATUS_CONFIG, SEVERITY_CONFIG, TICKET_SEVERITIES } from '../constants/
 import { TicketCommentBox } from '../components/TicketCommentBox';
 import { TicketCommentFeed } from '../components/TicketCommentFeed';
 import { TicketAttachmentsCard } from '../components/TicketAttachmentsCard';
+import { TicketHandoffTimeline } from '../components/TicketHandoffTimeline';
 import { PassOrReassignModal } from '../components/PassOrReassignModal';
 import { HoldTicketModal } from '../components/HoldTicketModal';
 import { CloseTicketModal } from '../components/CloseTicketModal';
@@ -898,6 +899,12 @@ export const TicketDetailsPage = () => {
                 </div>
               </div>
             </div>
+
+            {/* Handoff History Timeline */}
+            <TicketHandoffTimeline
+              ticketId={id}
+              initialHandoffs={ticket.handoffs || []}
+            />
 
             {/* Discussion & Triage Feed */}
             <div className="bg-surface-card rounded-xl p-space-lg shadow-sm space-y-space-lg">

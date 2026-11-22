@@ -29,6 +29,7 @@ export const TicketBoardPage = () => {
     setSeverityFilter,
     statusFilter,
     setStatusFilter,
+    hasResolvedTickets,
     updateTicketStatus,
     refetch,
   } = useTickets();
@@ -37,9 +38,14 @@ export const TicketBoardPage = () => {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [draggedTicketId, setDraggedTicketId] = useState(null);
 
-  const columns = TICKET_STATUSES.map((key) => ({
+  const baseStatusKeys = [...TICKET_STATUSES];
+  if (hasResolvedTickets || (boardTickets.resolved && boardTickets.resolved.length > 0)) {
+    baseStatusKeys.push('resolved');
+  }
+
+  const columns = baseStatusKeys.map((key) => ({
     key,
-    label: STATUS_CONFIG[key]?.label || key,
+    label: key === 'resolved' ? 'Legacy: resolved' : (STATUS_CONFIG[key]?.label || key),
     color: STATUS_CONFIG[key]?.dot || 'bg-outline',
   }));
 
@@ -55,6 +61,11 @@ export const TicketBoardPage = () => {
 
   const handleDrop = async (e, targetStatus) => {
     e.preventDefault();
+    // Never allow moving to resolved
+    if (targetStatus === 'resolved') {
+      setActionError("Cannot resolve tickets directly. Tickets must follow the verified lifecycle.");
+      return;
+    }
     const ticketId = e.dataTransfer.getData('text/plain') || draggedTicketId;
     if (!ticketId) return;
 
@@ -73,6 +84,7 @@ export const TicketBoardPage = () => {
         onStatusChange={setStatusFilter}
         onOpenCreateModal={() => setShowCreateModal(true)}
         isWsConnected={isWsConnected}
+        hasResolvedTickets={hasResolvedTickets}
       />
 
       {/* Action Error Banner (e.g. Drag & Drop failure / rollback notice) */}
@@ -108,8 +120,8 @@ export const TicketBoardPage = () => {
           />
         </div>
       ) : (
-        /* 5 Kanban Columns Container: Smooth Horizontal Scroll on mobile/tablet, 5-col Grid on Desktop */
-        <div className="flex overflow-x-auto pb-4 gap-space-md xl:grid xl:grid-cols-5 xl:overflow-x-visible items-start">
+        /* Kanban Columns Container: Smooth Horizontal Scroll on mobile/tablet, Dynamic Grid on Desktop */
+        <div className={`flex overflow-x-auto pb-4 gap-space-md ${columns.length > 5 ? 'xl:grid xl:grid-cols-6' : 'xl:grid xl:grid-cols-5'} xl:overflow-x-visible items-start`}>
           {columns.map((col) => {
             const colTickets = boardTickets[col.key] || [];
 

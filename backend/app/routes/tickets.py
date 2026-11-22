@@ -63,6 +63,7 @@ from backend.app.schemas import (
     TicketCommentRead,
     TicketAttachmentRead,
     TicketActivityRead,
+    TicketHandoffRead,
 )
 from backend.app.core.websockets import ws_manager, authenticate_ws
 
@@ -214,7 +215,8 @@ async def get_ticket_stats(
     now = datetime.now(timezone.utc)
     total = len(tickets)
     open_count = sum(1 for t in tickets if (t.status or "").lower() == "open")
-    wip_count = sum(1 for t in tickets if (t.status or "").lower() == "wip")
+    wip_count = sum(1 for t in tickets if (t.status or "").lower() in ("wip", "in_progress"))
+    passed_count = sum(1 for t in tickets if (t.status or "").lower() == "passed")
     on_hold_count = sum(1 for t in tickets if (t.status or "").lower() == "on_hold")
     resolved_count = sum(1 for t in tickets if (t.status or "").lower() == "resolved")
     closed_count = sum(1 for t in tickets if (t.status or "").lower() == "closed")
@@ -224,6 +226,7 @@ async def get_ticket_stats(
         total=total,
         open=open_count,
         wip=wip_count,
+        passed=passed_count,
         on_hold=on_hold_count,
         resolved=resolved_count,
         closed=closed_count,
@@ -336,17 +339,22 @@ async def get_ticket_board(
         sla_status=sla_status,
     )
 
+    has_resolved = any((t.status or "").lower() == "resolved" for t in tickets)
     board: Dict[str, List] = {
         "open": [],
         "wip": [],
+        "passed": [],
         "on_hold": [],
-        "resolved": [],
-        "closed": [],
     }
+    if has_resolved:
+        board["resolved"] = []
+    board["closed"] = []
 
     for t in tickets:
         status_key = (t.status or "").lower()
-        if status_key in board:
+        if status_key in ("in_progress", "wip"):
+            board["wip"].append(TicketRead.model_validate(t))
+        elif status_key in board:
             board[status_key].append(TicketRead.model_validate(t))
         else:
             board["open"].append(TicketRead.model_validate(t))
@@ -582,6 +590,7 @@ async def create_ticket(
     return out_obj
 
 
+
 # =========================================================================
 # DYNAMIC ROUTE /{ticket_id} AND SUB-ROUTES
 # =========================================================================
@@ -601,6 +610,8 @@ async def get_ticket_details(
             selectinload(Ticket.comments).selectinload(TicketComment.author),
             selectinload(Ticket.attachments).selectinload(TicketAttachment.uploader),
             selectinload(Ticket.activities).selectinload(TicketActivity.actor),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.from_user),
+            selectinload(Ticket.handoffs).selectinload(TicketHandoff.to_user),
         ).where(or_(Ticket.id == ticket_id, Ticket.ticket_number == ticket_id))
     )
     ticket = res.scalars().first()
@@ -732,6 +743,7 @@ async def update_ticket(
     )
 
     return out_obj
+
 
 
 @router.delete("/{ticket_id}", status_code=status.HTTP_200_OK)
@@ -1678,6 +1690,7 @@ async def change_ticket_status(
     return out_obj
 
 
+
 @router.patch("/{ticket_id}/severity", response_model=TicketRead)
 async def change_ticket_severity(
     ticket_id: str,
@@ -1748,6 +1761,7 @@ async def change_ticket_severity(
         data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
     )
     return out_obj
+
 
 
 @router.patch("/{ticket_id}/assignee", response_model=TicketRead)
@@ -1834,6 +1848,7 @@ async def reassign_ticket(
     return out_obj
 
 
+
 @router.patch("/{ticket_id}/deadline", response_model=TicketRead)
 async def change_ticket_deadline(
     ticket_id: str,
@@ -1898,6 +1913,7 @@ async def change_ticket_deadline(
         data={"ticket": TicketRead.model_validate(out_obj).model_dump(mode="json")},
     )
     return out_obj
+
 
 
 # =========================================================================
@@ -2010,6 +2026,7 @@ async def accept_ticket(
     )
 
     return out_obj
+
 
 
 @router.post("/{ticket_id}/pass", response_model=TicketRead)
@@ -2218,6 +2235,7 @@ async def pass_ticket(
     return out_obj
 
 
+
 @router.post("/{ticket_id}/hold", response_model=TicketRead)
 async def hold_ticket(
     ticket_id: str,
@@ -2330,6 +2348,7 @@ async def hold_ticket(
     return out_obj
 
 
+
 @router.post("/{ticket_id}/resume", response_model=TicketRead)
 async def resume_ticket(
     ticket_id: str,
@@ -2440,6 +2459,7 @@ async def resume_ticket(
     )
 
     return out_obj
+
 
 
 @router.post("/{ticket_id}/close", response_model=TicketRead)
@@ -2584,6 +2604,7 @@ async def close_ticket(
     return out_obj
 
 
+
 @router.post("/{ticket_id}/reopen", response_model=TicketRead)
 async def reopen_ticket(
     ticket_id: str,
@@ -2696,6 +2717,7 @@ async def reopen_ticket(
     )
 
     return out_obj
+
 
 
 @router.post("/{ticket_id}/reassign", response_model=TicketRead)
@@ -2899,3 +2921,62 @@ async def reassign_ticket_endpoint(
     )
 
     return out_obj
+
+
+@router.get("/{ticket_id}/handoffs", response_model=List[TicketHandoffRead])
+async def list_ticket_handoffs(
+    ticket_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all handoff records for this ticket with attached messages and files."""
+    ticket = await _get_authorized_ticket(ticket_id, current_user, db)
+
+    res = await db.execute(
+        select(TicketHandoff)
+        .options(
+            selectinload(TicketHandoff.from_user),
+            selectinload(TicketHandoff.to_user),
+        )
+        .where(TicketHandoff.ticket_id == ticket.id)
+        .order_by(desc(TicketHandoff.created_at))
+    )
+    handoffs = res.scalars().all()
+
+    # Load comments and attachments for this ticket to correlate attachments
+    comments_res = await db.execute(
+        select(TicketComment)
+        .options(
+            selectinload(TicketComment.attachments).selectinload(TicketAttachment.uploader)
+        )
+        .where(TicketComment.ticket_id == ticket.id)
+    )
+    comments = comments_res.scalars().all()
+
+    results = []
+    for h in handoffs:
+        matched_atts = []
+        for c in comments:
+            if c.author_id == h.from_user_id and c.content == h.message:
+                matched_atts = c.attachments
+                break
+
+        results.append(
+            TicketHandoffRead(
+                id=h.id,
+                ticket_id=h.ticket_id,
+                from_user_id=h.from_user_id,
+                to_user_id=h.to_user_id,
+                from_user=UserRead.model_validate(h.from_user) if h.from_user else None,
+                to_user=UserRead.model_validate(h.to_user) if h.to_user else None,
+                message=h.message,
+                status_before=h.status_before,
+                status_after=h.status_after,
+                kind=h.kind or "pass",
+                created_at=h.created_at,
+                attachments=[TicketAttachmentRead.model_validate(a) for a in matched_atts],
+            )
+        )
+    return results
+
+

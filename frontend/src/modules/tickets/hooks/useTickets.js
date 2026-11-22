@@ -66,12 +66,13 @@ export const useTickets = ({
         const total = items.length;
         const open = items.filter((t) => (t.status || '').toLowerCase() === 'open').length;
         const wip = items.filter((t) => ['wip', 'in_progress'].includes((t.status || '').toLowerCase())).length;
+        const passed = items.filter((t) => (t.status || '').toLowerCase() === 'passed').length;
         const on_hold = items.filter((t) => (t.status || '').toLowerCase() === 'on_hold').length;
         const resolved = items.filter((t) => (t.status || '').toLowerCase() === 'resolved').length;
         const closed = items.filter((t) => (t.status || '').toLowerCase() === 'closed').length;
         const sla_breached = items.filter((t) => t.is_breached).length;
 
-        setStats({ total, open, wip, on_hold, resolved, closed, sla_breached });
+        setStats({ total, open, wip, passed, on_hold, resolved, closed, sla_breached });
       }
     } catch (err) {
       console.error('Failed to load tickets data:', err);
@@ -120,6 +121,7 @@ export const useTickets = ({
                 'ticket_severity_changed',
                 'ticket_deleted',
                 'ticket_comment_added',
+                'ticket_handoff',
               ].includes(eventType)
             ) {
               fetchTicketsData();
@@ -151,22 +153,33 @@ export const useTickets = ({
     };
   }, [autoConnectWs, fetchTicketsData]);
 
+  const hasResolvedTickets = useMemo(() => {
+    return (stats?.resolved ?? 0) > 0 || tickets.some((t) => (t.status || '').toLowerCase() === 'resolved');
+  }, [stats, tickets]);
+
   // Group tickets by status for Board View (using lowercase enum values)
   const boardTickets = useMemo(() => {
     const groups = {};
     for (const st of TICKET_STATUSES) {
       groups[st] = [];
     }
+    if (hasResolvedTickets) {
+      groups.resolved = [];
+    }
     for (const t of tickets) {
       const st = (t.status || '').toLowerCase();
-      if (groups[st]) {
+      if (st === 'in_progress') {
+        groups.wip.push(t);
+      } else if (groups[st]) {
         groups[st].push(t);
+      } else if (st === 'resolved' && groups.resolved) {
+        groups.resolved.push(t);
       } else {
         groups.open.push(t);
       }
     }
     return groups;
-  }, [tickets]);
+  }, [tickets, hasResolvedTickets]);
 
   // Group tickets by severity for Priority View (using lowercase enum values)
   const priorityTickets = useMemo(() => {
@@ -242,6 +255,7 @@ export const useTickets = ({
     setStatusFilter,
     slaFilter,
     setSlaFilter,
+    hasResolvedTickets,
     updateTicketStatus,
     fetchTicketsData,
     refetch: fetchTicketsData,
