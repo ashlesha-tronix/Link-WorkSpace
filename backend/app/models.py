@@ -232,8 +232,10 @@ class TicketAttachment(Base):
     __tablename__ = "ticket_attachments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    ticket_id: Mapped[str] = mapped_column(String(36), ForeignKey("tickets.id"), nullable=False)
+    ticket_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("tickets.id", ondelete="CASCADE"), nullable=True)
     comment_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("ticket_comments.id", ondelete="SET NULL"), nullable=True)
+    discussion_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("discussions.id", ondelete="CASCADE"), nullable=True)
+    discussion_comment_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("discussion_comments.id", ondelete="SET NULL"), nullable=True)
     uploader_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     original_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -246,11 +248,14 @@ class TicketAttachment(Base):
 
     __table_args__ = (
         Index("ix_ticket_attachments_ticket_id_created_at", "ticket_id", "created_at"),
+        Index("ix_ticket_attachments_discussion_id_created_at", "discussion_id", "created_at"),
     )
 
-    ticket: Mapped["Ticket"] = relationship(back_populates="attachments")
+    ticket: Mapped[Optional["Ticket"]] = relationship(back_populates="attachments")
     uploader: Mapped["User"] = relationship("User")
     comment: Mapped[Optional["TicketComment"]] = relationship("TicketComment", back_populates="attachments")
+    discussion: Mapped[Optional["Discussion"]] = relationship("Discussion", foreign_keys=[discussion_id])
+    discussion_comment: Mapped[Optional["DiscussionComment"]] = relationship("DiscussionComment", foreign_keys=[discussion_comment_id])
 
     @property
     def name(self) -> str:
@@ -317,6 +322,7 @@ class Discussion(Base):
     project: Mapped["Project"] = relationship("Project")
     author: Mapped["User"] = relationship("User")
     comments: Mapped[list["DiscussionComment"]] = relationship(back_populates="discussion", cascade="all, delete-orphan")
+    attachments: Mapped[list["TicketAttachment"]] = relationship("TicketAttachment", primaryjoin="and_(Discussion.id==TicketAttachment.discussion_id, TicketAttachment.discussion_comment_id.is_(None))", cascade="all, delete-orphan", overlaps="discussion")
 
 
 class DiscussionComment(Base):
@@ -330,6 +336,7 @@ class DiscussionComment(Base):
 
     discussion: Mapped["Discussion"] = relationship(back_populates="comments")
     author: Mapped["User"] = relationship("User")
+    attachments: Mapped[list["TicketAttachment"]] = relationship("TicketAttachment", foreign_keys="[TicketAttachment.discussion_comment_id]", cascade="all, delete-orphan", overlaps="discussion_comment")
 
 
 class ProjectFile(Base):

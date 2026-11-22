@@ -709,13 +709,15 @@ class TicketAttachmentCreate(BaseSchema):
 
 class TicketAttachmentRead(BaseSchema):
     id: str
-    ticket_id: str
+    ticket_id: Optional[str] = None
     uploader_id: str
     name: str
     original_name: Optional[str] = None
     stored_name: Optional[str] = None
     content_type: Optional[str] = None
     comment_id: Optional[str] = None
+    discussion_id: Optional[str] = None
+    discussion_comment_id: Optional[str] = None
     size_bytes: int = 0
     file_url: str = ""
     created_at: datetime
@@ -798,11 +800,22 @@ class CriticalIssuesResponse(BaseSchema):
 
 # --- Discussions Schemas ---
 class DiscussionCommentBase(BaseSchema):
-    content: str
+    content: Optional[str] = None
 
 
 class DiscussionCommentCreate(BaseSchema):
-    content: str
+    content: Optional[str] = None
+    attachment_ids: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def validate_content_or_attachments(self) -> "DiscussionCommentCreate":
+        has_text = bool(self.content and self.content.strip())
+        has_attachments = bool(self.attachment_ids and len(self.attachment_ids) > 0)
+        if not has_text and not has_attachments:
+            raise ValueError("Reply must include text content or at least one attachment.")
+        if self.attachment_ids and len(self.attachment_ids) > 5:
+            raise ValueError("A reply can have at most 5 attachments.")
+        return self
 
 
 class DiscussionCommentRead(DiscussionCommentBase):
@@ -811,6 +824,7 @@ class DiscussionCommentRead(DiscussionCommentBase):
     author_id: str
     created_at: datetime
     author: Optional[UserRead] = None
+    attachments: List[TicketAttachmentRead] = Field(default_factory=list)
 
 
 class DiscussionBase(BaseSchema):
@@ -828,6 +842,7 @@ class DiscussionCreate(BaseSchema):
     category: Optional[str] = "general"
     is_pinned: Optional[bool] = False
     reactions: Optional[str] = "{}"
+    attachment_ids: Optional[List[str]] = None
 
 
 class DiscussionRead(DiscussionBase):
@@ -838,6 +853,7 @@ class DiscussionRead(DiscussionBase):
     updated_at: Optional[datetime] = None
     author: Optional[UserRead] = None
     comments: List[DiscussionCommentRead] = Field(default_factory=list)
+    attachments: List[TicketAttachmentRead] = Field(default_factory=list)
 
 
 # --- Project Files Schemas ---
